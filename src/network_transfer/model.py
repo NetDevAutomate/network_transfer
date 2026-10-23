@@ -16,7 +16,17 @@ Three ceilings are computed and the lowest wins:
    ``1.054 * MSS * RTT^-0.25 * p^-0.75``), which is how CUBIC itself behaves: it falls
    back to the Reno rate in the TCP-friendly region.
 
-Per-flow bounds are multiplied by the number of parallel streams, then capped by (1).
+Per-flow bounds are multiplied by the number of parallel streams, then capped by (1) and,
+when a DMS replication instance class is given, by (4) **its network baseline** -- an EC2
+"up to" size settles at its baseline once burst credits are spent.
+
+Two DMS-specific refinements sit on top:
+
+- **Largest-table tail** -- DMS parallelism is per table, so once the smaller tables
+  finish the remainder of the biggest one loads on a single stream (:func:`estimate_tail`).
+- **CDC catch-up** -- changes the source generates during the full load must be replayed
+  while more keep arriving; a geometric series that converges only when the change rate
+  is below goodput (:func:`estimate_cdc`).
 """
 
 from __future__ import annotations
@@ -171,6 +181,13 @@ class TransferInputs:
     tcp_window_bytes: int = DEFAULT_TCP_WINDOW_BYTES
     route_factor: float = DEFAULT_ROUTE_FACTOR
     rtt_ms_override: float | None = None
+    #: Network baseline of the DMS replication instance (a fourth ceiling), or None.
+    instance_bps: float | None = None
+    #: Size of the largest single table. DMS parallelism is per table, so once the other
+    #: tables finish the remainder of this one loads on a single stream.
+    largest_table_bytes: float | None = None
+    #: Bytes of change the source generates per second while the load runs (CDC).
+    change_bps_bytes: float | None = None
 
     def __post_init__(self) -> None:
         if self.streams < 1:
@@ -178,6 +195,17 @@ class TransferInputs:
             raise ValueError(msg)
         if not 0 <= self.loss_fraction < 1:
             msg = "loss_fraction must be in [0, 1)"
+            raise ValueError(msg)
+        if self.instance_bps is not None and self.instance_bps <= 0:
+            msg = "instance_bps must be positive"
+            raise ValueError(msg)
+        if self.largest_table_bytes is not None and not (
+            0 < self.largest_table_bytes <= self.data_bytes
+        ):
+            msg = "largest_table_bytes must be positive and no larger than data_bytes"
+            raise ValueError(msg)
+        if self.change_bps_bytes is not None and self.change_bps_bytes < 0:
+            msg = "change_bps_bytes must be >= 0"
             raise ValueError(msg)
 
 
@@ -206,6 +234,50 @@ class ThroughputEstimate:
     streams: int
     aggregate_bps: float
     bottleneck: str
+    #: Replication-instance network baseline, when given; it caps the aggregate.
+    instance_bound_bps: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TailEstimate:
+    """The single-stream tail that loads the remainder of the largest table.
+
+    DMS parallelism is per table (``MaxFullLoadSubTasks`` tables at once). With ``n``
+    streams, total ``D`` and a largest table ``L``, the big table holds one stream for the
+    whole load while the other ``D - L`` bytes share the remaining ``n - 1``. When those
+    finish, the big table has received ``(D - L) / (n - 1)`` bytes and its remainder loads
+    on a single stream. There is no tail when ``L <= D / n`` (the big table is no larger
+    than its fair share) or when ``n == 1``. Assumes the other tables pack evenly across
+    their streams, which is optimistic for a handful of very uneven tables.
+    """
+
+    parallel_bytes: float
+    parallel_seconds: float
+    tail_bytes: float
+    tail_seconds: float
+    tail_bps: float
+
+    @property
+    def has_tail(self) -> bool:
+        """True when part of the load runs on a single stream."""
+        return self.tail_bytes > 0
+
+
+@dataclass(frozen=True, slots=True)
+class CdcEstimate:
+    """Change-data-capture catch-up after the full load.
+
+    While the full load runs for ``T`` seconds the source generates ``r * T`` bytes of
+    change. Replaying it at goodput ``g`` takes ``r * T / g`` seconds, during which
+    another ``r * (r * T / g)`` bytes arrive, and so on: a geometric series that
+    converges to ``r * T / (g - r)`` when ``r < g`` and never converges otherwise.
+    """
+
+    change_rate_bytes_per_s: float
+    backlog_bytes: float
+    catch_up_seconds: float  # math.inf when the change rate meets or exceeds goodput
+    converges: bool
+    headroom_fraction: float  # (g - r) / g; how much of goodput is left for catch-up
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +290,15 @@ class TransferEstimate:
     bytes_including_retransmits: float
     line_rate_seconds: float
     seconds: float
+    tail: TailEstimate | None = None
+    cdc: CdcEstimate | None = None
+
+    @property
+    def total_seconds(self) -> float:
+        """Full load plus CDC catch-up (when a change rate was given)."""
+        if self.cdc is None:
+            return self.seconds
+        return self.seconds + self.cdc.catch_up_seconds
 
     @property
     def consider_offline_transfer(self) -> bool:
@@ -274,15 +355,23 @@ def estimate_throughput(inputs: TransferInputs, latency: LatencyEstimate) -> Thr
     rtt_s = latency.rtt_ms / 1000.0
     profile = inputs.profile
     link_goodput = inputs.link_bps * profile.efficiency
+    # The replication instance's baseline is measured at its ENI, so it pays the same
+    # framing overhead as the link. None -> no fourth ceiling.
+    instance_goodput = (
+        inputs.instance_bps * profile.efficiency if inputs.instance_bps is not None else None
+    )
+    hard_cap = link_goodput if instance_goodput is None else min(link_goodput, instance_goodput)
     window_bound = inputs.tcp_window_bytes * 8 / rtt_s
     reno = reno_bound_bps(profile.mss_bytes, rtt_s, inputs.loss_fraction)
     cubic = cubic_bound_bps(profile.mss_bytes, rtt_s, inputs.loss_fraction)
     loss_bound = max(reno, cubic)
-    per_flow = min(window_bound, loss_bound, link_goodput)
+    per_flow = min(window_bound, loss_bound, hard_cap)
     aggregate_flows = per_flow * inputs.streams
-    aggregate = min(aggregate_flows, link_goodput)
+    aggregate = min(aggregate_flows, hard_cap)
 
-    if aggregate >= link_goodput:
+    if aggregate >= hard_cap and instance_goodput is not None and instance_goodput < link_goodput:
+        bottleneck = "DMS replication instance network baseline"
+    elif aggregate >= hard_cap:
         bottleneck = "link (line rate x profile efficiency)"
     elif window_bound <= loss_bound:
         bottleneck = f"TCP receive window ({inputs.streams} stream(s) x window/RTT)"
@@ -299,6 +388,54 @@ def estimate_throughput(inputs: TransferInputs, latency: LatencyEstimate) -> Thr
         streams=inputs.streams,
         aggregate_bps=aggregate,
         bottleneck=bottleneck,
+        instance_bound_bps=instance_goodput,
+    )
+
+
+def estimate_tail(inputs: TransferInputs, throughput: ThroughputEstimate) -> TailEstimate:
+    """Split the load into an all-streams phase and a single-stream largest-table tail."""
+    total = inputs.data_bytes / (1 - inputs.loss_fraction)
+    largest = (inputs.largest_table_bytes or 0.0) / (1 - inputs.loss_fraction)
+    n = inputs.streams
+    others = total - largest
+    big_table_loaded_in_parallel = others / (n - 1) if n > 1 else 0.0
+    tail_bytes = max(0.0, largest - big_table_loaded_in_parallel) if n > 1 else 0.0
+    parallel_bytes = total - tail_bytes
+    aggregate = throughput.aggregate_bps
+    tail_bps = throughput.per_flow_bps
+    parallel_seconds = parallel_bytes * 8 / aggregate if aggregate else math.inf
+    tail_seconds = tail_bytes * 8 / tail_bps if tail_bytes and tail_bps else 0.0
+    return TailEstimate(
+        parallel_bytes=parallel_bytes,
+        parallel_seconds=parallel_seconds,
+        tail_bytes=tail_bytes,
+        tail_seconds=tail_seconds,
+        tail_bps=tail_bps,
+    )
+
+
+def estimate_cdc(
+    change_bytes_per_s: float, full_load_seconds: float, goodput_bps: float
+) -> CdcEstimate:
+    """Catch-up time for the changes that accumulate during the full load."""
+    backlog = change_bytes_per_s * full_load_seconds
+    change_bps = change_bytes_per_s * 8
+    if change_bps >= goodput_bps or math.isinf(full_load_seconds):
+        return CdcEstimate(
+            change_rate_bytes_per_s=change_bytes_per_s,
+            backlog_bytes=backlog,
+            catch_up_seconds=math.inf,
+            converges=False,
+            headroom_fraction=max(0.0, (goodput_bps - change_bps) / goodput_bps),
+        )
+    # Geometric series: backlog / g + backlog r/g^2 + ... = backlog / (g - r)  (in bits)
+    catch_up = backlog * 8 / (goodput_bps - change_bps)
+    return CdcEstimate(
+        change_rate_bytes_per_s=change_bytes_per_s,
+        backlog_bytes=backlog,
+        catch_up_seconds=catch_up,
+        converges=True,
+        headroom_fraction=(goodput_bps - change_bps) / goodput_bps,
     )
 
 
@@ -309,7 +446,20 @@ def estimate_transfer(inputs: TransferInputs) -> TransferEstimate:
     # Lost segments are resent; the bytes that cross the wire grow by 1/(1-p).
     bytes_on_wire = inputs.data_bytes / (1 - inputs.loss_fraction)
     line_rate_seconds = inputs.data_bytes * 8 / inputs.link_bps
-    seconds = bytes_on_wire * 8 / throughput.aggregate_bps if throughput.aggregate_bps else math.inf
+    tail: TailEstimate | None = None
+    if inputs.largest_table_bytes is not None:
+        tail = estimate_tail(inputs, throughput)
+        seconds = tail.parallel_seconds + tail.tail_seconds
+    else:
+        seconds = (
+            bytes_on_wire * 8 / throughput.aggregate_bps if throughput.aggregate_bps else math.inf
+        )
+    cdc: CdcEstimate | None = None
+    if inputs.change_bps_bytes is not None:
+        # Changes replay over the same path; retransmits apply to them too.
+        cdc = estimate_cdc(
+            inputs.change_bps_bytes / (1 - inputs.loss_fraction), seconds, throughput.aggregate_bps
+        )
     return TransferEstimate(
         inputs=inputs,
         latency=latency,
@@ -317,4 +467,6 @@ def estimate_transfer(inputs: TransferInputs) -> TransferEstimate:
         bytes_including_retransmits=bytes_on_wire,
         line_rate_seconds=line_rate_seconds,
         seconds=seconds,
+        tail=tail,
+        cdc=cdc,
     )

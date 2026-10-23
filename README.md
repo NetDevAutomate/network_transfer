@@ -19,7 +19,7 @@ Approx. RTT         9.4 ms (estimated)
 Data size           2.00 TB (2.00 TB incl. retransmits)
 Parallel streams    8
 Goodput (modelled)  382.0 Mbps -- bottleneck: TCP loss recovery (8 stream(s), CUBIC/Reno under loss)
-Transfer time       11h 38m  (line-rate ideal: 4h 26m, x2.6 slower)
+Full-load time      11h 38m  (line-rate ideal: 4h 26m, x2.6 slower)
 
 ! Bound by loss recovery: fix the loss before buying bandwidth -- ...
 ==============================================================================
@@ -27,7 +27,7 @@ Path                dx -- dedicated circuit onto the AWS backbone; AWS publishes
 Packet loss         0.0010%
 Approx. RTT         7.4 ms (estimated)
 Goodput (modelled)  941.5 Mbps -- bottleneck: link (line rate x profile efficiency)
-Transfer time       4h 43m  (line-rate ideal: 4h 26m, x1.1 slower)
+Full-load time      4h 43m  (line-rate ideal: 4h 26m, x1.1 slower)
 ```
 
 That gap -- 11.6 h vs 4.7 h on the *same* 1 Gbps link -- is the whole reason the tool
@@ -55,7 +55,81 @@ nettransfer --add-city "Leeds" --add-city "Portland, Dorset"   # fetch from Open
 nettransfer --size 1T --from leeds --to eu-west-2 --link 1G
 nettransfer --list-cities
 nettransfer --list-profiles
+nettransfer --list-instances
+
+# DMS realism: biggest table, change rate during the load, replication instance class
+nettransfer --size 2T --largest-table 1.2T --change-rate 40G/day --dms-instance dms.r5.large \
+            --from london --to eu-west-1 --link 10G --path dx
+
+# Sensitivity: one table across plausible values instead of five runs
+nettransfer --size 2T --from london --to sydney --link 1G --sweep loss=0.01,0.1,0.5,1
+
+# Markdown for Quip/Confluence/a customer doc
+nettransfer --size 2T --from london --to dublin --link 1G --compare --format md
 ```
+
+### DMS realism
+
+Three optional inputs turn the network calculator into a migration-plan check:
+
+```
+$ nettransfer --size 2T --largest-table 1.2T --change-rate 40G/day --dms-instance dms.r5.large \
+              --from london --to eu-west-1 --link 10G --path dx
+
+DMS instance        750.0 Mbps baseline (706.1 Mbps goodput after framing)
+Goodput (modelled)  706.1 Mbps -- bottleneck: DMS replication instance network baseline
+Largest-table tail  1.09 TB on 1 stream @ 607.3 Mbps = 3h 58m (after 2h 52m parallel)
+Full-load time      6h 51m  (line-rate ideal: 26m 40s, x15.4 slower)
+CDC backlog         11.42 GB accrued during full load @ 462.97 kB/s (3.7 Mbps)
+CDC catch-up        2m 10s (headroom 99%)
+Total to cut-over   6h 53m
+
+! Bound by the replication instance's network baseline, not the link: pick a larger class ...
+! 58% of the load is a single-stream tail on the largest table: use DMS parallel-load ...
+```
+
+- **`--dms-instance CLASS`** -- a replication instance is an EC2 instance, and sizes of
+  `4xlarge` and below have a *baseline* network allowance far below their "up to" burst
+  (`dms.r5.large`: 0.75 Gbps baseline, 10 Gbps burst). Burst credits last 5-60 minutes; a
+  load that runs for hours settles at the baseline, so a 10 G Direct Connect into an
+  `r5.large` delivers 0.75 G. The baseline becomes a fourth ceiling. Figures are from the
+  [EC2 Instance Types Guide](https://docs.aws.amazon.com/ec2/latest/instancetypes/mo.html)
+  network tables for the classes DMS supports (T3, C5, C6i, R5, R6i); `--list-instances`.
+- **`--largest-table SIZE`** -- DMS parallelism is per table (`MaxFullLoadSubTasks` tables
+  at once). While the smaller tables share `n - 1` streams the big one gets one stream;
+  when they finish, its remainder (`L - (D - L)/(n - 1)`) loads alone. There is no tail if
+  the largest table is within its fair share (`L <= D / n`). The tail only *costs* time
+  when one stream is slower than the aggregate -- i.e. on window- or loss-bound paths,
+  which is exactly where DMS loads get surprised. Fix: DMS parallel-load (partitions or
+  range segmentation) on that table.
+- **`--change-rate SIZE/PERIOD`** -- while the full load runs for `T` seconds the source
+  writes `r * T` bytes of change. Replaying it at goodput `g` takes `r T / g`, during which
+  `r (r T / g)` more arrives, and so on: a geometric series summing to `r T / (g - r)`.
+  If `r >= g` it **never converges** and the output says so -- the most common way a
+  cut-over plan fails. Headroom `(g - r) / g` under 50 % gets a warning.
+
+### Sensitivity sweeps
+
+`--sweep PARAM=V1,V2,...` re-runs the estimate for each value and tabulates goodput,
+bottleneck, full-load time and total-to-cut-over. Parameters: `loss`, `link`, `streams`,
+`rtt`, `tcp-window`, `size`. Combine with `--compare` for a path column, `--format md` for
+a Markdown table, or `--json` for a list of full results.
+
+```
+London -> Sydney, 2T over 1G, sweeping loss
+
+loss  Goodput     Bottleneck         Full load  Total to cut-over
+----  ----------  -----------------  ---------  -----------------
+0.01  140.1 Mbps  TCP loss recovery  1d 7h      --
+0.1   24.9 Mbps   TCP loss recovery  1w 10h     --
+0.5   7.5 Mbps    TCP loss recovery  3w 3d      --
+1     4.8 Mbps    TCP loss recovery  5w 4d      --
+```
+
+### Output formats
+
+`--format text` (default), `--format md` (two-column Markdown table + bullet advice; compare
+mode separates paths with `---`), `--format json` (same as `--json`).
 
 ### Cities not in the built-in list
 
@@ -82,8 +156,13 @@ themselves are fully offline. `--cities-file PATH` relocates the store.
 | `--streams` | parallel TCP connections | 8 (DMS `MaxFullLoadSubTasks`) |
 | `--tcp-window` | per-connection receive window | `6MiB` (Linux `tcp_rmem` max) |
 | `--route-factor` | fibre path / great-circle ratio | 1.4 |
+| `--dms-instance` | DMS replication instance class; its network baseline is a ceiling | -- |
+| `--largest-table` | size of the biggest table; models the single-stream tail | -- |
+| `--change-rate` | source change rate during the load (`40G/day`); adds CDC catch-up | -- |
+| `--sweep` | `PARAM=V1,V2,...` over `loss`, `link`, `streams`, `rtt`, `tcp-window`, `size` | -- |
 | `--compare` | run internet and dx side by side | off |
-| `--json` | machine-readable output | off |
+| `--format` | `text`, `md` or `json` | `text` |
+| `--json` | same as `--format json` | off |
 | `--verbose` | show every ceiling computed | off |
 
 ## The model
@@ -99,6 +178,7 @@ flowchart LR
     L[link bps] --> E[link goodput<br/>= link x profile efficiency]
     PR[profile] --> E
     PR -->|MSS| CC
+    DI[--dms-instance<br/>baseline x efficiency] -.caps.-> AG
 
     R --> W[window bound<br/>= window / RTT]
     R --> CC[loss bound<br/>= max Reno, CUBIC]
@@ -107,19 +187,22 @@ flowchart LR
     W --> PF[per-flow = min W, CC, E]
     CC --> PF
     E --> PF
-    PF -->|x streams| AG[aggregate = min streams x per-flow, E]
+    PF -->|x streams| AG[aggregate = min streams x per-flow, E, instance]
     E --> AG
-    AG --> T[time = bytes / 1-p x 8 / aggregate]
+    AG --> T[full load = bytes / 1-p x 8 / aggregate<br/>+ single-stream tail of largest table]
+    T --> CDC[CDC catch-up = r T / g - r]
 ```
 
-Three ceilings are computed and the lowest one wins. The output names which one bound,
-because the fix is different in each case:
+Three network ceilings are computed and the lowest one wins (a fourth, the replication
+instance baseline, applies when `--dms-instance` is given). The output names which one
+bound, because the fix is different in each case:
 
 | Bottleneck | What it means | What to do |
 |---|---|---|
 | **link** | the pipe is full | buy bandwidth, or ship offline |
 | **TCP receive window** | `window / RTT` per flow; the link is idle | raise `tcp_rmem`/`tcp_wmem`, add streams |
 | **TCP loss recovery** | congestion control backs off under loss | fix the loss (DX, better peering) before buying bandwidth; jumbo frames help |
+| **DMS replication instance** | the EC2 baseline allowance is below the link | bigger class (8xlarge+ have no burst tier), or split across instances |
 
 ### Formulas and sources
 
@@ -159,6 +242,10 @@ because the fix is different in each case:
 - **Source or target speed.** DMS full loads are frequently bound by the source database's
   read rate, LOB handling, or the target's write/index rate -- not the network. The output
   says so every time. Run a pilot table and compare.
+- **Compression.** The WAN leg is source -> replication instance and DMS sends it
+  uncompressed; target-side formats (parquet, gzip) do not change the bytes on this hop.
+- **Uneven table packing.** The largest-table tail assumes the *other* tables pack evenly
+  across their streams; a few very large secondary tables make it optimistic.
 - **Congestion from other traffic**, bufferbloat, or ECMP path asymmetry.
 - **BBR.** The loss bound assumes loss-based congestion control (CUBIC/Reno). If both ends
   run BBR, the loss bound is pessimistic; the window bound still applies.
@@ -171,12 +258,14 @@ because the fix is different in each case:
 
 ```sh
 uv sync
-uv run pytest                                   # 106 tests, coverage gate 90 %
+uv run pytest                                   # 157 tests, coverage gate 90 %
 uv run ruff check . && uv run ruff format --check .
 uv run pyright                                  # strict
 pre-commit run --hook-stage manual --all-files  # same gate the repo's hooks enforce
 ```
 
 Layout: `src/network_transfer/units.py` (parsing/formatting), `cities.py` (offline
-gazetteer + haversine + user store), `geocode.py` (Nominatim lookup for --add-city), `model.py` (the physics and TCP model, every constant named),
-`cli.py` (argparse, text/JSON rendering, advice).
+gazetteer + haversine + user store), `geocode.py` (Nominatim lookup for --add-city),
+`dms.py` (replication-instance network allowances), `model.py` (the physics and TCP model
+plus the DMS tail and CDC refinements, every constant named), `cli.py` (argparse, sweep,
+text/Markdown/JSON rendering, advice).

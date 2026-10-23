@@ -127,6 +127,48 @@ def parse_percent(text: str) -> float:
     return value / 100.0
 
 
+_PERIOD_SECONDS: dict[str, float] = {
+    "s": 1.0,
+    "sec": 1.0,
+    "second": 1.0,
+    "min": 60.0,
+    "minute": 60.0,
+    "h": 3600.0,
+    "hr": 3600.0,
+    "hour": 3600.0,
+    "d": 86400.0,
+    "day": 86400.0,
+    "w": 7 * 86400.0,
+    "week": 7 * 86400.0,
+}
+
+
+def parse_data_rate(text: str) -> float:
+    """Return bytes per second for ``40G/day``, ``500MB/h``, ``2T/week`` or ``1.5GB/s``.
+
+    The numerator is a data size (decimal or binary units, as :func:`parse_data_size`);
+    the denominator is a period. ``0/day`` is accepted (a quiescent source).
+
+    >>> parse_data_rate("86.4G/day")
+    1000000.0
+    """
+    size_text, sep, period_text = text.partition("/")
+    if not sep:
+        msg = f"Cannot parse data rate {text!r}: expected SIZE/PERIOD, e.g. 40G/day"
+        raise ValueError(msg)
+    period_key = period_text.strip().lower().rstrip("s") or "s"  # "days" -> "day", "s" -> "s"
+    seconds = _PERIOD_SECONDS.get(period_key)
+    if seconds is None:
+        msg = f"Unknown period {period_text.strip()!r} in {text!r}: use s, min, h, day or week"
+        raise ValueError(msg)
+    value, unit = _split(size_text, "data rate")
+    multiplier = _DECIMAL_BYTES.get(unit) or _BINARY_BYTES.get(unit)
+    if multiplier is None:
+        msg = f"Unknown data-size unit {unit!r} in {text!r}: use g, t, p (or gib, tib, pib)"
+        raise ValueError(msg)
+    return value * multiplier / seconds
+
+
 def parse_distance_km(text: str) -> float:
     """Return kilometres for ``450``, ``450km`` or ``280mi``."""
     value, unit = _split(text, "distance")

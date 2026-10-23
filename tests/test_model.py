@@ -216,3 +216,133 @@ def test_inputs_reject_bad_streams_and_loss() -> None:
         make_inputs(streams=0)
     with pytest.raises(ValueError, match="loss_fraction"):
         make_inputs(loss_fraction=1.0)
+
+
+# --- DMS realism: instance ceiling ------------------------------------------------------
+
+
+def test_instance_baseline_caps_aggregate_and_names_itself() -> None:
+    est = estimate_transfer(make_inputs(link_bps=10e9, instance_bps=0.75e9))
+    tp = est.throughput
+    assert tp.instance_bound_bps == pytest.approx(0.75e9 * PROFILES["full"].efficiency)
+    assert tp.aggregate_bps == pytest.approx(tp.instance_bound_bps)
+    assert tp.bottleneck == "DMS replication instance network baseline"
+
+
+def test_instance_larger_than_link_does_not_bind() -> None:
+    est = estimate_transfer(make_inputs(link_bps=1e9, instance_bps=10e9))
+    assert est.throughput.bottleneck.startswith("link")
+    assert est.throughput.aggregate_bps == pytest.approx(est.throughput.link_goodput_bps)
+
+
+def test_instance_caps_per_flow_too() -> None:
+    # Single stream on a short path: per-flow would be link-bound, but the instance is lower.
+    est = estimate_transfer(make_inputs(link_bps=10e9, instance_bps=0.75e9, streams=1))
+    assert est.throughput.per_flow_bps == pytest.approx(est.throughput.instance_bound_bps)
+
+
+# --- DMS realism: largest-table tail ----------------------------------------------------
+
+
+def test_tail_two_phase_arithmetic() -> None:
+    # 2 TB total, 1.2 TB largest, 8 streams, no loss, link-bound at 1G.
+    est = estimate_transfer(make_inputs(largest_table_bytes=1.2e12, streams=8))
+    tail = est.tail
+    assert tail is not None and tail.has_tail
+    others = 2e12 - 1.2e12
+    expected_tail = 1.2e12 - others / 7
+    assert tail.tail_bytes == pytest.approx(expected_tail)
+    assert tail.parallel_bytes == pytest.approx(2e12 - expected_tail)
+    assert tail.tail_bps == pytest.approx(est.throughput.per_flow_bps)
+    assert tail.parallel_seconds == pytest.approx(
+        tail.parallel_bytes * 8 / est.throughput.aggregate_bps
+    )
+    assert tail.tail_seconds == pytest.approx(tail.tail_bytes * 8 / tail.tail_bps)
+    assert est.seconds == pytest.approx(tail.parallel_seconds + tail.tail_seconds)
+
+
+def test_tail_costs_time_only_when_per_flow_is_below_aggregate() -> None:
+    # Link-bound short path: one stream already fills the link, so the tail is free.
+    short = estimate_transfer(make_inputs(largest_table_bytes=1.2e12, streams=8))
+    plain = estimate_transfer(make_inputs(streams=8))
+    assert short.seconds == pytest.approx(plain.seconds)
+    # Window-bound long path: a single stream is 1/8 of the aggregate, so the tail hurts.
+    long_tail = estimate_transfer(
+        make_inputs(distance_km=LONDON_SYDNEY_KM, largest_table_bytes=1.2e12, streams=8)
+    )
+    long_plain = estimate_transfer(make_inputs(distance_km=LONDON_SYDNEY_KM, streams=8))
+    assert long_tail.seconds > 2 * long_plain.seconds
+
+
+def test_no_tail_when_largest_table_is_within_fair_share_or_single_stream() -> None:
+    fair = estimate_transfer(make_inputs(largest_table_bytes=0.25e12, streams=8))
+    assert fair.tail is not None and not fair.tail.has_tail
+    assert fair.tail.tail_seconds == 0.0
+    single = estimate_transfer(make_inputs(largest_table_bytes=1.5e12, streams=1))
+    assert single.tail is not None and not single.tail.has_tail
+    assert single.seconds == pytest.approx(estimate_transfer(make_inputs(streams=1)).seconds)
+
+
+def test_tail_bytes_include_retransmits() -> None:
+    est = estimate_transfer(make_inputs(largest_table_bytes=1.2e12, loss_fraction=0.01))
+    assert est.tail is not None
+    assert est.tail.parallel_bytes + est.tail.tail_bytes == pytest.approx(2e12 / 0.99)
+
+
+# --- DMS realism: CDC catch-up ----------------------------------------------------------
+
+
+def test_cdc_geometric_series_closed_form() -> None:
+    est = estimate_transfer(make_inputs(change_bps_bytes=1e6))  # 1 MB/s of change
+    cdc = est.cdc
+    assert cdc is not None and cdc.converges
+    g = est.throughput.aggregate_bps
+    r = 1e6 * 8
+    backlog_bits = 1e6 * est.seconds * 8
+    assert cdc.backlog_bytes == pytest.approx(1e6 * est.seconds)
+    assert cdc.catch_up_seconds == pytest.approx(backlog_bits / (g - r))
+    assert cdc.headroom_fraction == pytest.approx((g - r) / g)
+    assert est.total_seconds == pytest.approx(est.seconds + cdc.catch_up_seconds)
+
+
+def test_cdc_catch_up_exceeds_naive_backlog_over_goodput() -> None:
+    # The series matters: naive backlog/g undercounts because changes keep arriving.
+    est = estimate_transfer(make_inputs(change_bps_bytes=50e6))  # 400 Mbps vs ~941 Mbps
+    cdc = est.cdc
+    assert cdc is not None
+    naive = cdc.backlog_bytes * 8 / est.throughput.aggregate_bps
+    assert cdc.catch_up_seconds > 1.5 * naive
+
+
+def test_cdc_never_converges_when_change_rate_meets_goodput() -> None:
+    goodput_bytes = estimate_transfer(make_inputs()).throughput.aggregate_bps / 8
+    est = estimate_transfer(make_inputs(change_bps_bytes=goodput_bytes))
+    assert est.cdc is not None
+    assert not est.cdc.converges
+    assert est.cdc.catch_up_seconds == math.inf
+    assert est.cdc.headroom_fraction == 0.0
+    assert est.total_seconds == math.inf
+
+
+def test_cdc_zero_change_rate_is_instant() -> None:
+    est = estimate_transfer(make_inputs(change_bps_bytes=0.0))
+    assert est.cdc is not None
+    assert est.cdc.catch_up_seconds == 0.0
+    assert est.cdc.headroom_fraction == 1.0
+
+
+def test_total_seconds_without_cdc_is_full_load() -> None:
+    est = estimate_transfer(make_inputs())
+    assert est.cdc is None
+    assert est.total_seconds == est.seconds
+
+
+def test_inputs_reject_bad_dms_fields() -> None:
+    with pytest.raises(ValueError, match="instance_bps"):
+        make_inputs(instance_bps=0.0)
+    with pytest.raises(ValueError, match="largest_table_bytes"):
+        make_inputs(largest_table_bytes=3e12)
+    with pytest.raises(ValueError, match="largest_table_bytes"):
+        make_inputs(largest_table_bytes=0.0)
+    with pytest.raises(ValueError, match="change_bps_bytes"):
+        make_inputs(change_bps_bytes=-1.0)

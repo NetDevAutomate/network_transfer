@@ -29,7 +29,7 @@ def test_basic_text_report(capsys: pytest.CaptureFixture[str]) -> None:
     assert row(out, "Packet loss", "0.1000%")
     assert row(out, "Data size", "2.00 TB (2.00 TB incl. retransmits)")
     assert "km great circle" in out
-    assert "Transfer time" in out
+    assert "Full-load time" in out
     assert "network ceiling only" in out
 
 
@@ -261,3 +261,210 @@ def test_unknown_city_error_mentions_add_city(capsys: pytest.CaptureFixture[str]
     with pytest.raises(SystemExit):
         main(["--size", "2T", "--link", "1G", "--from", "Xyzzyville", "--to", "dublin"])
     assert "--add-city 'Xyzzyville'" in capsys.readouterr().err
+
+
+# --- DMS realism flags ------------------------------------------------------------------
+
+DMS_ARGS = (
+    "--size", "2T", "--largest-table", "1.2T", "--change-rate", "40G/day",
+    "--dms-instance", "dms.r5.large", "--from", "london", "--to", "eu-west-1",
+    "--link", "10G", "--path", "dx",
+)  # fmt: skip
+
+
+def test_dms_realism_report(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out = run(capsys, *DMS_ARGS)
+    assert code == 0
+    assert row(out, "DMS instance", "750.0 Mbps baseline")
+    assert "bottleneck: DMS replication instance network baseline" in out
+    assert row(out, "Largest-table tail", "1.09 TB on 1 stream")
+    assert "CDC backlog" in out
+    assert "CDC catch-up" in out
+    assert "Total to cut-over" in out
+    assert "Bound by the replication instance's network baseline" in out
+    assert "single-stream tail on the largest table" in out
+
+
+def test_dms_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(capsys, *DMS_ARGS, "--json")
+    data = json.loads(out)
+    assert data["inputs"]["instance_bps"] == pytest.approx(0.75e9)
+    assert data["tail"]["tail_bytes"] > 0
+    assert data["cdc"]["converges"] is True
+    assert data["total_seconds"] > data["seconds"]
+    assert "total_time_human" in data
+
+
+def test_cdc_never_converges_warning(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(
+        capsys,
+        "--size", "2T", "--from", "london", "--to", "dublin", "--link", "100M",
+        "--change-rate", "2TB/day",  # ~185 Mbps of change over a 100M link
+    )  # fmt: skip
+    assert "NEVER -- change rate >= goodput" in out
+    assert "CDC will never catch up" in out
+    assert row(out, "Total to cut-over", "never")
+
+
+def test_cdc_low_headroom_warning(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(
+        capsys,
+        "--size", "2T", "--from", "london", "--to", "dublin", "--link", "1G",
+        "--change-rate", "6TB/day", "--loss", "0",  # ~555 Mbps vs 941 Mbps goodput
+    )  # fmt: skip
+    assert "headroom" in out
+    assert "catch-up is slow" in out
+
+
+def test_instance_burst_note_for_short_loads(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(
+        capsys,
+        "--size", "50G", "--from", "london", "--to", "dublin", "--link", "10G",
+        "--dms-instance", "r5.large",
+    )  # fmt: skip
+    assert "run on burst credits" in out
+
+
+def test_unknown_instance_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--size", "2T", "--link", "1G", "--distance", "100km", "--dms-instance", "m5.large"])
+    assert excinfo.value.code == 2
+    assert "Unknown DMS instance class" in capsys.readouterr().err
+
+
+def test_bad_change_rate_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--size", "2T", "--link", "1G", "--distance", "100km", "--change-rate", "40G"])
+    assert "SIZE/PERIOD" in capsys.readouterr().err
+
+
+def test_list_instances(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out = run(capsys, "--list-instances")
+    assert code == 0
+    assert re.search(r"^dms\.r5\.large\s+baseline\s+750\.0 Mbps\s+burst 10\.0 Gbps", out, re.M)
+    assert re.search(r"^dms\.r5\.8xlarge\s+baseline\s+10\.0 Gbps\s+no burst tier", out, re.M)
+
+
+# --- --sweep ----------------------------------------------------------------------------
+
+
+def test_sweep_loss_text_table(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out = run(
+        capsys,
+        "--size", "2T", "--from", "london", "--to", "sydney", "--link", "1G",
+        "--sweep", "loss=0.01,0.1,0.5,1",
+    )  # fmt: skip
+    assert code == 0
+    lines = out.strip().splitlines()
+    assert lines[0] == "London -> Sydney, 2T over 1G, sweeping loss"
+    assert lines[2].split() == [
+        "loss",
+        "Goodput",
+        "Bottleneck",
+        "Full",
+        "load",
+        "Total",
+        "to",
+        "cut-over",
+    ]
+    body = lines[4:]
+    assert [ln.split()[0] for ln in body] == ["0.01", "0.1", "0.5", "1"]
+    assert all("TCP loss recovery" in ln for ln in body)
+    assert all(ln.rstrip().endswith("--") for ln in body)  # no CDC -> no total
+
+
+def test_sweep_streams_and_compare_adds_path_column(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(
+        capsys,
+        "--size", "2T", "--from", "london", "--to", "sydney", "--link", "1G",
+        "--sweep", "streams=1,8", "--compare", "--loss", "0",
+    )  # fmt: skip
+    lines = out.strip().splitlines()
+    assert lines[2].split()[:2] == ["streams", "path"]
+    body = lines[4:]
+    assert len(body) == 4
+    assert [ln.split()[:2] for ln in body] == [
+        ["1", "internet"], ["1", "dx"], ["8", "internet"], ["8", "dx"],
+    ]  # fmt: skip
+
+
+def test_sweep_markdown_and_json(capsys: pytest.CaptureFixture[str]) -> None:
+    base = (
+        "--size", "2T", "--from", "london", "--to", "dublin", "--link", "1G",
+        "--change-rate", "40G/day", "--sweep", "link=100M,1G,10G",
+    )  # fmt: skip
+    _, out = run(capsys, *base, "--format", "md")
+    lines = out.strip().splitlines()
+    assert lines[0].startswith("### London -> Dublin")
+    assert lines[2] == "| link | Goodput | Bottleneck | Full load | Total to cut-over |"
+    assert lines[3] == "|---|---|---|---|---|"
+    assert lines[4].startswith("| 100M |")
+
+    _, out = run(capsys, *base, "--json")
+    data = json.loads(out)
+    assert [d["sweep"]["link"] for d in data] == ["100M", "1G", "10G"]
+    assert data[0]["seconds"] > data[2]["seconds"]
+
+
+@pytest.mark.parametrize("sweep", ["loss", "loss=0.1", "colour=1,2", "rtt=10,abc"])
+def test_sweep_rejects_bad_specs(capsys: pytest.CaptureFixture[str], sweep: str) -> None:
+    with pytest.raises(SystemExit):
+        main(["--size", "2T", "--link", "1G", "--distance", "100km", "--sweep", sweep])
+    assert capsys.readouterr().err
+
+
+def test_sweep_rtt_and_window_and_size(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(
+        capsys, "--size", "2T", "--link", "1G", "--distance", "100km",
+        "--sweep", "rtt=10,100", "--json",
+    )  # fmt: skip
+    data = json.loads(out)
+    assert data[0]["latency"]["rtt_ms"] == 10.0
+    assert data[1]["latency"]["rtt_ms"] == 100.0
+    _, out = run(
+        capsys, "--size", "2T", "--link", "1G", "--distance", "100km",
+        "--sweep", "tcp-window=1MiB,64MiB", "--json",
+    )  # fmt: skip
+    data = json.loads(out)
+    assert data[0]["inputs"]["tcp_window_bytes"] == 2**20
+    _, out = run(
+        capsys, "--size", "2T", "--link", "1G", "--distance", "100km",
+        "--sweep", "size=1T,4T", "--json",
+    )  # fmt: skip
+    data = json.loads(out)
+    assert data[1]["seconds"] == pytest.approx(4 * data[0]["seconds"])
+
+
+# --- --format md ------------------------------------------------------------------------
+
+
+def test_markdown_report(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out = run(
+        capsys, "--size", "2T", "--from", "london", "--to", "dublin", "--link", "1G",
+        "--format", "md",
+    )  # fmt: skip
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0] == "| Item | Value |"
+    assert lines[1] == "|---|---|"
+    assert "| Source | London |" in lines
+    assert any(ln.startswith("| Full-load time |") for ln in lines)
+    assert any(ln.startswith("- ! Bound by loss recovery") for ln in lines)
+    assert "=" * 78 not in out
+
+
+def test_markdown_compare_uses_rule_separator(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(
+        capsys, "--size", "2T", "--from", "london", "--to", "dublin", "--link", "1G",
+        "--format", "md", "--compare", "-v",
+    )  # fmt: skip
+    assert "\n---\n" in out
+    assert out.count("| Item | Value |") == 2
+    assert "| per-flow CUBIC bound |" in out  # verbose rows are stripped of indent
+
+
+def test_format_json_equals_json_flag(capsys: pytest.CaptureFixture[str]) -> None:
+    args = ("--size", "2T", "--from", "london", "--to", "dublin", "--link", "1G")
+    _, a = run(capsys, *args, "--format", "json")
+    _, b = run(capsys, *args, "--json")
+    assert json.loads(a) == json.loads(b)

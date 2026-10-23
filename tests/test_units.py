@@ -4,6 +4,7 @@ from network_transfer.units import (
     format_bps,
     format_bytes,
     format_duration,
+    parse_data_rate,
     parse_data_size,
     parse_distance_km,
     parse_link_rate,
@@ -93,3 +94,27 @@ def test_format_helpers() -> None:
 )
 def test_format_duration(seconds: float, expected: str) -> None:
     assert format_duration(seconds) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("86.4G/day", 1e6),
+        ("40G/day", 40e9 / 86400),
+        ("2GB/h", 2e9 / 3600),
+        ("500MB/hour", 500e6 / 3600),
+        ("1T/week", 1e12 / (7 * 86400)),
+        ("1.5GB/s", 1.5e9),
+        ("600M/min", 1e7),
+        ("1GiB/hr", 2**30 / 3600),
+        ("0/day", 0.0),
+    ],
+)
+def test_parse_data_rate(text: str, expected: float) -> None:
+    assert parse_data_rate(text) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("bad", ["40G", "40G/fortnight", "40X/day", "fast/day"])
+def test_parse_data_rate_rejects(bad: str) -> None:
+    with pytest.raises(ValueError):
+        parse_data_rate(bad)
