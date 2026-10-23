@@ -66,7 +66,38 @@ nettransfer --size 2T --from london --to sydney --link 1G --sweep loss=0.01,0.1,
 
 # Markdown for Quip/Confluence/a customer doc
 nettransfer --size 2T --from london --to dublin --link 1G --compare --format md
+
+# Route through the Direct Connect location instead of the great circle
+nettransfer --size 5T --from manchester --via london --to eu-west-1 --link 10G --path dx
+
+# Feed a real measurement straight in instead of retyping --rtt/--loss
+mtr -rwc 100 10.0.0.5 > mtr.txt && nettransfer --size 2T --from leeds --to eu-west-2 --link 1G --measure mtr.txt
+ping -c 200 10.0.0.5 | nettransfer --size 2T --distance 300km --link 1G --measure -
 ```
+
+### Real routes: `--via`
+
+Traffic to `eu-west-1` from Manchester does not take the great circle to Dublin; it rides
+the customer's WAN to the Direct Connect location (London: Equinix LD4/LD5, Telehouse) and
+then the AWS backbone. `--via CITY` (repeatable, in order) sums the legs:
+Manchester → London → Dublin is 725 km, not 262 km, and the RTT follows. The route factor
+still applies per leg -- a leg is not a straight fibre either.
+
+### Real measurements: `--measure FILE`
+
+Paste `ping` or `mtr -r` output (or `-` for stdin) and the tool takes **RTT and loss** from
+it, labelling both as measured in the report. Explicit `--rtt`/`--loss` still win.
+
+- **ping** (macOS/BSD and Linux): `avg` RTT, and loss from the transmitted/received
+  *counts* rather than the rounded percentage.
+- **mtr** (`-r`, `-rw`, `-rwc N`, `-rz`): the **last responding hop** supplies RTT and
+  loss. Loss on intermediate hops is deliberately ignored -- routers rate-limit ICMP
+  TTL-exceeded replies, so mid-path "loss" is normally an artefact; the final hop is
+  end-to-end. If the destination filters ICMP (`???` at the end) the previous hop is used
+  and the report says so.
+- **Sample size**: loss resolution is `1 / probes`. `0 %` over 10 packets only proves
+  loss is below 10 %, and the model will happily use 0; the report tells you to re-measure
+  with at least 100 (`mtr -rwc 100`, `ping -c 100`).
 
 ### DMS realism
 
@@ -146,6 +177,7 @@ themselves are fully offline. `--cities-file PATH` relocates the store.
 | `--size` | data to move: `500G`, `2T`, `1.5P` (decimal) or `100GiB`, `2TiB` (binary) | required |
 | `--link` | link size in bit/s: `100M`, `1G`, `10G` | required |
 | `--from` / `--to` | city names or AWS region codes (`eu-west-1`, `us-east-1`); fuzzy-matched | -- |
+| `--via` | intermediate city (repeatable, in order), e.g. the DX location; legs are summed | -- |
 | `--distance` | explicit great-circle distance instead of cities: `450km`, `280mi` | -- |
 | `--add-city` | geocode NAME online and save it for future runs (repeatable); exits | -- |
 | `--cities-file` | where added cities live | `~/.config/nettransfer/cities.json` |
@@ -153,6 +185,7 @@ themselves are fully offline. `--cities-file PATH` relocates the store.
 | `--profile` | `full` (1500 B), `jumbo` (9001 B, DX only), `imix` (shared/chatty link) | `full` |
 | `--loss` | packet loss in % (`0.1` = 0.1 %) | 0.1 % internet, 0.001 % dx |
 | `--rtt` | measured RTT in ms; overrides the distance estimate | estimated |
+| `--measure` | read RTT and loss from pasted `ping`/`mtr -r` output (`-` = stdin) | -- |
 | `--streams` | parallel TCP connections | 8 (DMS `MaxFullLoadSubTasks`) |
 | `--tcp-window` | per-connection receive window | `6MiB` (Linux `tcp_rmem` max) |
 | `--route-factor` | fibre path / great-circle ratio | 1.4 |
@@ -258,7 +291,7 @@ bound, because the fix is different in each case:
 
 ```sh
 uv sync
-uv run pytest                                   # 157 tests, coverage gate 90 %
+uv run pytest                                   # 179 tests, coverage gate 90 %
 uv run ruff check . && uv run ruff format --check .
 uv run pyright                                  # strict
 pre-commit run --hook-stage manual --all-files  # same gate the repo's hooks enforce
@@ -266,6 +299,6 @@ pre-commit run --hook-stage manual --all-files  # same gate the repo's hooks enf
 
 Layout: `src/network_transfer/units.py` (parsing/formatting), `cities.py` (offline
 gazetteer + haversine + user store), `geocode.py` (Nominatim lookup for --add-city),
-`dms.py` (replication-instance network allowances), `model.py` (the physics and TCP model
-plus the DMS tail and CDC refinements, every constant named), `cli.py` (argparse, sweep,
-text/Markdown/JSON rendering, advice).
+`dms.py` (replication-instance network allowances), `measure.py` (ping/mtr output parser),
+`model.py` (the physics and TCP model plus the DMS tail and CDC refinements, every constant
+named), `cli.py` (argparse, routes, sweep, text/Markdown/JSON rendering, advice).

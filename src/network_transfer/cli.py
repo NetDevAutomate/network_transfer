@@ -7,8 +7,9 @@ import json
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from network_transfer import __version__
 from network_transfer.cities import (
@@ -21,6 +22,7 @@ from network_transfer.cities import (
 )
 from network_transfer.dms import INSTANCES, lookup_instance
 from network_transfer.geocode import Fetcher, geocode
+from network_transfer.measure import Measurement, parse_measurement
 from network_transfer.model import (
     DEFAULT_ROUTE_FACTOR,
     DEFAULT_STREAMS,
@@ -61,8 +63,14 @@ sensitivity and reporting:
   nettransfer --size 2T --from london --to sydney --link 1G --sweep loss=0.01,0.1,0.5,1
   nettransfer --size 2T --from london --to dublin --link 1G --compare --format md
 
+real paths and real measurements:
+  nettransfer --size 5T --from manchester --via london --to eu-west-1 --link 10G --path dx
+  mtr -rwc 100 10.0.0.5 > mtr.txt && nettransfer --size 2T --from leeds --to eu-west-2 \\
+              --link 1G --measure mtr.txt
+  ping -c 200 10.0.0.5 | nettransfer --size 2T --distance 300km --link 1G --measure -
+
 Measure before you trust the estimate: `ping`/`mtr` for RTT and loss, `iperf3 -P 8` for
-achievable throughput. Pass the real numbers back in with --rtt and --loss.
+achievable throughput. Pass the real numbers back in with --rtt/--loss or --measure.
 """
 
 SWEEP_PARAMS = ("loss", "link", "streams", "rtt", "tcp-window", "size")
@@ -108,6 +116,16 @@ def build_parser() -> argparse.ArgumentParser:
     where.add_argument("--from", dest="src", metavar="CITY", help="source city or AWS region")
     where.add_argument("--to", dest="dst", metavar="CITY", help="destination city or AWS region")
     where.add_argument(
+        "--via",
+        action="append",
+        metavar="CITY",
+        default=None,
+        help=(
+            "route through this city (repeatable, in order), e.g. the Direct Connect location:"
+            " --from manchester --via london --to eu-west-1. Distance is the sum of the legs"
+        ),
+    )
+    where.add_argument(
         "--distance", "-d", help="explicit great-circle distance (450km, 280mi) instead of cities"
     )
 
@@ -138,6 +156,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="MS",
         help="measured round-trip time in ms (overrides estimate)",
+    )
+    net.add_argument(
+        "--measure",
+        metavar="FILE",
+        help=(
+            "read RTT and loss from pasted `ping` or `mtr -r` output (FILE, or - for stdin)."
+            " mtr uses the last responding hop. Explicit --rtt/--loss still win"
+        ),
     )
     net.add_argument(
         "--streams",
@@ -211,19 +237,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_endpoints(args: argparse.Namespace, store: UserCities) -> tuple[str, str, float]:
-    """Return (source label, destination label, great-circle km)."""
+@dataclass(frozen=True, slots=True)
+class Route:
+    """Resolved endpoints: labels for the report and the summed great-circle distance."""
+
+    source: str
+    destination: str
+    via: tuple[str, ...]
+    km: float
+
+    @property
+    def label(self) -> str:
+        """``London -> Dublin`` or ``Manchester -> London -> Dublin``."""
+        return " -> ".join((self.source, *self.via, self.destination))
+
+
+def _resolve_endpoints(args: argparse.Namespace, store: UserCities) -> Route:
+    """Resolve ``--from/--via/--to`` (or ``--distance``) into a :class:`Route`."""
+    via_names: list[str] = args.via or []
     if args.distance is not None:
+        if via_names:
+            msg = "--via cannot be combined with --distance; give the full distance instead"
+            raise ValueError(msg)
         km = parse_distance_km(args.distance)
-        src = args.src or "A"
-        dst = args.dst or "B"
-        return src, dst, km
+        return Route(args.src or "A", args.dst or "B", (), km)
     if not (args.src and args.dst):
         msg = "give both --from and --to, or --distance"
         raise ValueError(msg)
-    a: City = lookup_city(args.src, store)
-    b: City = lookup_city(args.dst, store)
-    return a.name, b.name, haversine_km(a, b)
+    points: list[City] = [lookup_city(name, store) for name in (args.src, *via_names, args.dst)]
+    km = sum(haversine_km(a, b) for a, b in pairwise(points))
+    return Route(points[0].name, points[-1].name, tuple(c.name for c in points[1:-1]), km)
+
+
+def read_measurement(spec: str, stdin: TextIO | None = None) -> Measurement:
+    """Load ``--measure FILE`` (``-`` = stdin) and parse it."""
+    text = (stdin or sys.stdin).read() if spec == "-" else Path(spec).read_text(encoding="utf-8")
+    return parse_measurement(text)
 
 
 def add_cities(names: list[str], store: UserCities, fetch: Fetcher | None = None) -> list[str]:
@@ -243,8 +292,24 @@ def add_cities(names: list[str], store: UserCities, fetch: Fetcher | None = None
     return lines
 
 
-def _build_inputs(args: argparse.Namespace, path: PathType, distance_km: float) -> TransferInputs:
-    loss = parse_percent(args.loss) if args.loss is not None else PATH_DEFAULTS[path].loss_fraction
+def _build_inputs(
+    args: argparse.Namespace,
+    path: PathType,
+    distance_km: float,
+    measured: Measurement | None = None,
+) -> TransferInputs:
+    if args.loss is not None:
+        loss, loss_source = parse_percent(args.loss), "--loss"
+    elif measured is not None:
+        loss, loss_source = measured.loss_fraction, f"measured, {measured.label}"
+    else:
+        loss, loss_source = PATH_DEFAULTS[path].loss_fraction, "default"
+    if args.rtt is not None:
+        rtt, rtt_source = args.rtt, "--rtt"
+    elif measured is not None:
+        rtt, rtt_source = measured.rtt_ms, measured.label
+    else:
+        rtt, rtt_source = None, "--rtt"
     instance_bps = (
         lookup_instance(args.dms_instance).baseline_bps if args.dms_instance is not None else None
     )
@@ -258,7 +323,9 @@ def _build_inputs(args: argparse.Namespace, path: PathType, distance_km: float) 
         streams=args.streams,
         tcp_window_bytes=int(parse_data_size(args.tcp_window)),
         route_factor=args.route_factor,
-        rtt_ms_override=args.rtt,
+        rtt_ms_override=rtt,
+        rtt_source=rtt_source,
+        loss_source=loss_source,
         instance_bps=instance_bps,
         largest_table_bytes=(
             parse_data_size(args.largest_table) if args.largest_table is not None else None
@@ -312,15 +379,23 @@ def _with_sweep_value(args: argparse.Namespace, sweep: Sweep, value: str) -> arg
 Rows = list[tuple[str, str]]
 
 
-def _report_rows(src: str, dst: str, est: TransferEstimate, *, verbose: bool) -> Rows:
+def _report_rows(
+    route: Route, est: TransferEstimate, *, verbose: bool, measured: Measurement | None = None
+) -> Rows:
     i, lat, tp = est.inputs, est.latency, est.throughput
     rows: Rows = [
-        ("Source", src),
-        ("Destination", dst),
+        ("Source", route.source),
+        ("Destination", route.destination),
+    ]
+    if route.via:
+        rows.append(("Via", " -> ".join(route.via)))
+    loss_source = "" if i.loss_source == "default" else f" ({i.loss_source})"
+    rows += [
         (
             "Approx. distance",
             f"{lat.great_circle_km:,.0f} km great circle"
-            f" (~{lat.fibre_km:,.0f} km fibre @ x{i.route_factor})",
+            + (" over " + str(len(route.via) + 1) + " legs" if route.via else "")
+            + f" (~{lat.fibre_km:,.0f} km fibre @ x{i.route_factor})",
         ),
         ("Path", f"{i.path.value} -- {PATH_DEFAULTS[i.path].rationale}"),
         ("Link size", format_bps(i.link_bps)),
@@ -329,7 +404,7 @@ def _report_rows(src: str, dst: str, est: TransferEstimate, *, verbose: bool) ->
             f"{i.profile.name} -- {i.profile.description}"
             f" (efficiency {i.profile.efficiency:.1%}, MSS {i.profile.mss_bytes} B)",
         ),
-        ("Packet loss", f"{i.loss_fraction:.4%}"),
+        ("Packet loss", f"{i.loss_fraction:.4%}{loss_source}"),
         ("Approx. RTT", f"{lat.rtt_ms:.1f} ms ({lat.source})"),
         (
             "Data size",
@@ -404,30 +479,36 @@ def _report_rows(src: str, dst: str, est: TransferEstimate, *, verbose: bool) ->
     return rows
 
 
-def render_text(src: str, dst: str, est: TransferEstimate, *, verbose: bool) -> str:
+def render_text(
+    route: Route, est: TransferEstimate, *, verbose: bool, measured: Measurement | None = None
+) -> str:
     """Human-readable report."""
-    rows = _report_rows(src, dst, est, verbose=verbose)
+    rows = _report_rows(route, est, verbose=verbose, measured=measured)
     width = max(len(k) for k, _ in rows)
     lines = [f"{k:<{width}}  {v}" for k, v in rows]
     lines.append("")
-    lines.extend(_advice(est))
+    lines.extend(_advice(est, measured))
     return "\n".join(lines)
 
 
-def render_markdown(src: str, dst: str, est: TransferEstimate, *, verbose: bool) -> str:
+def render_markdown(
+    route: Route, est: TransferEstimate, *, verbose: bool, measured: Measurement | None = None
+) -> str:
     """Markdown two-column table plus the advice as a bullet list."""
-    rows = _report_rows(src, dst, est, verbose=verbose)
+    rows = _report_rows(route, est, verbose=verbose, measured=measured)
     lines = ["| Item | Value |", "|---|---|"]
     lines += [f"| {k.strip()} | {v.replace('|', '/')} |" for k, v in rows]
     lines.append("")
-    lines += [f"- {note}" for note in _advice(est)]
+    lines += [f"- {note}" for note in _advice(est, measured)]
     return "\n".join(lines)
 
 
-def _advice(est: TransferEstimate) -> list[str]:
+def _advice(est: TransferEstimate, measured: Measurement | None = None) -> list[str]:
     """Actionable notes derived from which ceiling binds."""
     notes: list[str] = []
     tp, i = est.throughput, est.inputs
+    if measured is not None:
+        notes.extend(f"~ {measured.tool}: {note}" for note in measured.notes)
     if est.cdc is not None and not est.cdc.converges:
         notes.append(
             "! CDC will never catch up: the source changes faster than this path can carry."
@@ -488,7 +569,9 @@ def _advice(est: TransferEstimate) -> list[str]:
     return notes
 
 
-def _to_json(src: str, dst: str, est: TransferEstimate) -> dict[str, Any]:
+def _to_json(
+    route: Route, est: TransferEstimate, measured: Measurement | None = None
+) -> dict[str, Any]:
     data = asdict(est)
     data["inputs"]["profile"] = {
         "name": est.inputs.profile.name,
@@ -496,8 +579,11 @@ def _to_json(src: str, dst: str, est: TransferEstimate) -> dict[str, Any]:
         "mss_bytes": est.inputs.profile.mss_bytes,
     }
     data["inputs"]["path"] = est.inputs.path.value
-    data["source"] = src
-    data["destination"] = dst
+    data["source"] = route.source
+    data["destination"] = route.destination
+    data["via"] = list(route.via)
+    if measured is not None:
+        data["measurement"] = asdict(measured)
     data["transfer_time_human"] = format_duration(est.seconds)
     data["total_seconds"] = est.total_seconds
     data["total_time_human"] = format_duration(est.total_seconds)
@@ -572,7 +658,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--size and --link are required")
 
     try:
-        src, dst, km = _resolve_endpoints(args, store)
+        route = _resolve_endpoints(args, store)
+        measured = read_measurement(args.measure) if args.measure is not None else None
         paths = list(PathType) if args.compare else [PathType(args.path)]
         if args.sweep is not None:
             sweep = parse_sweep(args.sweep)
@@ -580,7 +667,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 (
                     value,
                     p,
-                    estimate_transfer(_build_inputs(_with_sweep_value(args, sweep, value), p, km)),
+                    estimate_transfer(
+                        _build_inputs(_with_sweep_value(args, sweep, value), p, route.km, measured)
+                    ),
                 )
                 for value in sweep.values
                 for p in paths
@@ -589,31 +678,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             sweep = None
             swept = []
-            results = [(p, estimate_transfer(_build_inputs(args, p, km))) for p in paths]
-    except ValueError as exc:
+            results = [
+                (p, estimate_transfer(_build_inputs(args, p, route.km, measured))) for p in paths
+            ]
+    except (ValueError, OSError) as exc:
         parser.error(str(exc))
 
     if output_format == "json":
         if sweep is not None:
             payload: Any = [
-                {"sweep": {sweep.param: value}, **_to_json(src, dst, e)} for value, _, e in swept
+                {"sweep": {sweep.param: value}, **_to_json(route, e, measured)}
+                for value, _, e in swept
             ]
         elif args.compare:
-            payload = {p.value: _to_json(src, dst, e) for p, e in results}
+            payload = {p.value: _to_json(route, e, measured) for p, e in results}
         else:
-            payload = _to_json(src, dst, results[0][1])
+            payload = _to_json(route, results[0][1], measured)
         print(json.dumps(payload, indent=2, default=str))
         return 0
 
     if sweep is not None:
-        header = f"{src} -> {dst}, {args.size} over {args.link}, sweeping {sweep.param}"
+        header = f"{route.label}, {args.size} over {args.link}, sweeping {sweep.param}"
         print(("### " if output_format == "md" else "") + header)
         print()
         print(render_sweep(sweep, swept, markdown=output_format == "md"))
         return 0
 
     render = render_markdown if output_format == "md" else render_text
-    reports = [render(src, dst, e, verbose=args.verbose) for _, e in results]
+    reports = [render(route, e, verbose=args.verbose, measured=measured) for _, e in results]
     separator = "\n\n---\n\n" if output_format == "md" else "\n" + "=" * 78 + "\n"
     print(separator.join(reports))
     return 0

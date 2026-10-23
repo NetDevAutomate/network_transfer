@@ -1,6 +1,6 @@
 [project]
 name = "network-transfer"
-version = "0.3.0"
+version = "0.4.0"
 description = "Estimate WAN transfer time for bulk data moves (e.g. AWS DMS) from distance, link size, packet profile and loss."
 readme = "README.md"
 requires-python = ">=3.12"

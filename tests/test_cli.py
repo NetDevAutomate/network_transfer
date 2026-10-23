@@ -468,3 +468,161 @@ def test_format_json_equals_json_flag(capsys: pytest.CaptureFixture[str]) -> Non
     _, a = run(capsys, *args, "--format", "json")
     _, b = run(capsys, *args, "--json")
     assert json.loads(a) == json.loads(b)
+
+
+# --- --via ------------------------------------------------------------------------------
+
+
+def test_via_sums_legs_and_is_reported(capsys: pytest.CaptureFixture[str]) -> None:
+    _, direct = run(
+        capsys,
+        "--size",
+        "5T",
+        "--from",
+        "manchester",
+        "--to",
+        "eu-west-1",
+        "--link",
+        "10G",
+        "--json",
+    )
+    _, via = run(
+        capsys,
+        "--size", "5T", "--from", "manchester", "--via", "london", "--to", "eu-west-1",
+        "--link", "10G", "--json",
+    )  # fmt: skip
+    d, v = json.loads(direct), json.loads(via)
+    assert d["via"] == []
+    assert v["via"] == ["London"]
+    # Manchester->London (~262 km) + London->Dublin (~463 km) vs Manchester->Dublin (~262 km)
+    assert v["latency"]["great_circle_km"] > 2.5 * d["latency"]["great_circle_km"]
+    assert 700 < v["latency"]["great_circle_km"] < 750
+
+    _, out = run(
+        capsys,
+        "--size", "5T", "--from", "manchester", "--via", "london", "--to", "eu-west-1",
+        "--link", "10G",
+    )  # fmt: skip
+    assert row(out, "Via", "London")
+    assert "over 2 legs" in out
+
+
+def test_via_is_repeatable_in_order(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(
+        capsys,
+        "--size", "1T", "--from", "edinburgh", "--via", "manchester", "--via", "london",
+        "--to", "paris", "--link", "1G", "--sweep", "streams=1,8",
+    )  # fmt: skip
+    assert out.startswith("Edinburgh -> Manchester -> London -> Paris, 1T over 1G")
+
+
+def test_via_with_distance_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--size", "1T", "--link", "1G", "--distance", "100km", "--via", "london"])
+    assert "--via cannot be combined with --distance" in capsys.readouterr().err
+
+
+def test_via_unknown_city_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            ["--size", "1T", "--link", "1G", "--from", "london", "--via", "Xyzzy", "--to", "paris"]
+        )
+    assert "Unknown city 'Xyzzy'" in capsys.readouterr().err
+
+
+# --- --measure --------------------------------------------------------------------------
+
+PING_TEXT = """\
+--- 10.0.0.5 ping statistics ---
+20 packets transmitted, 19 packets received, 5.0% packet loss
+round-trip min/avg/max/stddev = 11.512/12.204/14.880/0.731 ms
+"""
+
+MTR_TEXT = """\
+HOST: h                             Loss%   Snt   Last   Avg  Best  Wrst StDev
+  1.|-- 10.1.0.1                     0.0%    10    0.4   0.5   0.3   1.2   0.1
+  2.|-- 52.93.12.7                   0.0%    10   11.9  12.3  11.7  15.1   0.5
+"""
+
+
+def test_measure_file_sets_rtt_and_loss(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    f = tmp_path / "ping.txt"
+    f.write_text(PING_TEXT)
+    code, out = run(
+        capsys, "--size", "2T", "--distance", "300km", "--link", "1G", "--measure", str(f)
+    )
+    assert code == 0
+    assert row(out, "Packet loss", "5.0000% (measured, ping, 20 pkts)")
+    assert row(out, "Approx. RTT", "12.2 ms (measured (ping, 20 pkts))")
+    assert "Bound by loss recovery" in out
+
+
+def test_measure_stdin_and_json(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(MTR_TEXT))
+    _, out = run(
+        capsys, "--size", "2T", "--distance", "300km", "--link", "1G", "--measure", "-", "--json"
+    )
+    data = json.loads(out)
+    assert data["measurement"]["tool"] == "mtr"
+    assert data["measurement"]["rtt_ms"] == 12.3
+    assert data["inputs"]["loss_fraction"] == 0.0
+    assert data["inputs"]["loss_source"] == "measured, mtr, 10 pkts"
+    assert data["latency"]["source"] == "measured (mtr, 10 pkts)"
+
+
+def test_measure_small_sample_note_is_shown(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    f = tmp_path / "mtr.txt"
+    f.write_text(MTR_TEXT)
+    _, out = run(capsys, "--size", "2T", "--distance", "300km", "--link", "1G", "--measure", str(f))
+    assert "~ mtr: 0 % loss over 10 probes only proves loss < 10%" in out
+
+
+def test_explicit_rtt_and_loss_beat_measurement(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    f = tmp_path / "ping.txt"
+    f.write_text(PING_TEXT)
+    _, out = run(
+        capsys,
+        "--size", "2T", "--distance", "300km", "--link", "1G", "--measure", str(f),
+        "--rtt", "30", "--loss", "0.1",
+    )  # fmt: skip
+    assert row(out, "Packet loss", "0.1000% (--loss)")
+    assert row(out, "Approx. RTT", "30.0 ms (measured (--rtt))")
+
+
+def test_measure_unparseable_and_missing_file_are_usage_errors(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    bad = tmp_path / "bad.txt"
+    bad.write_text("traceroute to somewhere\n")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--size", "2T", "--distance", "300km", "--link", "1G", "--measure", str(bad)])
+    assert excinfo.value.code == 2
+    assert "Could not recognise ping or mtr output" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--size",
+                "2T",
+                "--distance",
+                "300km",
+                "--link",
+                "1G",
+                "--measure",
+                str(tmp_path / "nope"),
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "nope" in capsys.readouterr().err
+
+
+def test_default_loss_has_no_provenance_suffix(capsys: pytest.CaptureFixture[str]) -> None:
+    _, out = run(capsys, "--size", "2T", "--from", "london", "--to", "dublin", "--link", "1G")
+    assert re.search(r"^Packet loss\s+0\.1000%$", out, re.M)

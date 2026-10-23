@@ -181,6 +181,10 @@ class TransferInputs:
     tcp_window_bytes: int = DEFAULT_TCP_WINDOW_BYTES
     route_factor: float = DEFAULT_ROUTE_FACTOR
     rtt_ms_override: float | None = None
+    #: Provenance shown next to an overridden RTT, e.g. "--rtt" or "ping, 20 pkts".
+    rtt_source: str = "--rtt"
+    #: Provenance of the loss figure: "default", "--loss" or a measurement label.
+    loss_source: str = "default"
     #: Network baseline of the DMS replication instance (a fourth ceiling), or None.
     instance_bps: float | None = None
     #: Size of the largest single table. DMS parallelism is per table, so once the other
@@ -321,7 +325,7 @@ def estimate_latency(inputs: TransferInputs) -> LatencyEstimate:
     overhead_ms = PATH_DEFAULTS[inputs.path].fixed_overhead_ms
     if inputs.rtt_ms_override is not None:
         rtt_ms = inputs.rtt_ms_override
-        source = "measured (--rtt)"
+        source = f"measured ({inputs.rtt_source})"
     else:
         rtt_ms = 2 * one_way_ms + overhead_ms  # overhead > 0, so same-metro RTT stays > 0
         source = "estimated"
