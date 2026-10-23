@@ -7,10 +7,19 @@ import json
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from network_transfer import __version__
-from network_transfer.cities import City, all_city_names, haversine_km, lookup_city
+from network_transfer.cities import (
+    City,
+    UserCities,
+    all_city_names,
+    default_store_path,
+    haversine_km,
+    lookup_city,
+)
+from network_transfer.geocode import Fetcher, geocode
 from network_transfer.model import (
     DEFAULT_ROUTE_FACTOR,
     DEFAULT_STREAMS,
@@ -39,6 +48,8 @@ examples:
   nettransfer --size 500G --distance 450km --link 500M --loss 0.5 --streams 1
   nettransfer --size 2T --from london --to sydney --link 1G --compare
   nettransfer --size 2T --from london --to dublin --link 1G --rtt 12   # use a measured RTT
+  nettransfer --add-city "Leeds" --add-city "Portland, Maine"          # fetch from OpenStreetMap
+  nettransfer --size 2T --from leeds --to eu-west-2 --link 1G
 
 Measure before you trust the estimate: `ping`/`mtr` for RTT and loss, `iperf3 -P 8` for
 achievable throughput. Pass the real numbers back in with --rtt and --loss.
@@ -60,6 +71,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-cities", action="store_true", help="print known cities and exit")
     parser.add_argument(
         "--list-profiles", action="store_true", help="print packet profiles and exit"
+    )
+    parser.add_argument(
+        "--add-city",
+        action="append",
+        metavar="NAME",
+        help=(
+            "look NAME up on OpenStreetMap (e.g. 'Leeds' or 'Portland, Maine'), save it for"
+            " future runs, and exit; repeatable. The only flag that uses the network."
+        ),
+    )
+    parser.add_argument(
+        "--cities-file",
+        type=Path,
+        default=None,
+        help=f"where added cities are stored (default {default_store_path()})",
     )
 
     required = parser.add_argument_group("required")
@@ -126,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_endpoints(args: argparse.Namespace) -> tuple[str, str, float]:
+def _resolve_endpoints(args: argparse.Namespace, store: UserCities) -> tuple[str, str, float]:
     """Return (source label, destination label, great-circle km)."""
     if args.distance is not None:
         km = parse_distance_km(args.distance)
@@ -136,9 +162,26 @@ def _resolve_endpoints(args: argparse.Namespace) -> tuple[str, str, float]:
     if not (args.src and args.dst):
         msg = "give both --from and --to, or --distance"
         raise ValueError(msg)
-    a: City = lookup_city(args.src)
-    b: City = lookup_city(args.dst)
+    a: City = lookup_city(args.src, store)
+    b: City = lookup_city(args.dst, store)
     return a.name, b.name, haversine_km(a, b)
+
+
+def add_cities(names: list[str], store: UserCities, fetch: Fetcher | None = None) -> list[str]:
+    """Geocode each name, persist it, and return one report line per city."""
+    lines: list[str] = []
+    for raw in names:
+        result = geocode(raw, fetch) if fetch is not None else geocode(raw)
+        city = City(name=result.name, lat=result.lat, lon=result.lon)
+        # "Portland, Dorset" refines the search; the stored key is what you type later.
+        key = raw.split(",")[0].strip()
+        replaced_builtin = store.add(key, city, source=f"nominatim: {result.display_name}")
+        lines.append(
+            f"added {key!r} -> {result.display_name} ({result.lat:.4f}, {result.lon:.4f})"
+            + ("  [overrides built-in]" if replaced_builtin else "")
+        )
+    lines.append(f"saved to {store.path}")
+    return lines
 
 
 def _build_inputs(args: argparse.Namespace, path: PathType, distance_km: float) -> TransferInputs:
@@ -272,9 +315,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Entry point. Returns a process exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    store = UserCities(args.cities_file)
 
+    if args.add_city:
+        try:
+            print("\n".join(add_cities(args.add_city, store)))
+        except ValueError as exc:
+            parser.error(str(exc))
+        return 0
     if args.list_cities:
-        print("\n".join(all_city_names()))
+        print("\n".join(all_city_names(store)))
         return 0
     if args.list_profiles:
         for prof in PROFILES.values():
@@ -287,7 +337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--size and --link are required")
 
     try:
-        src, dst, km = _resolve_endpoints(args)
+        src, dst, km = _resolve_endpoints(args, store)
         paths = list(PathType) if args.compare else [PathType(args.path)]
         results = [(p, estimate_transfer(_build_inputs(args, p, km))) for p in paths]
     except ValueError as exc:

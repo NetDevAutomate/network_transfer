@@ -1,9 +1,12 @@
 import json
 import re
+from pathlib import Path
 
 import pytest
 
-from network_transfer.cli import build_parser, main
+from network_transfer.cities import City, UserCities
+from network_transfer.cli import add_cities, build_parser, main
+from network_transfer.geocode import GeocodeResult
 
 
 def run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str]:
@@ -163,3 +166,98 @@ def test_parser_defaults() -> None:
     assert args.profile == "full"
     assert args.streams == 8
     assert args.tcp_window == "6MiB"
+
+
+# --- --add-city -------------------------------------------------------------------------
+
+LEEDS = GeocodeResult(
+    name="Leeds",
+    display_name="Leeds, West Yorkshire, England, United Kingdom",
+    lat=53.7974185,
+    lon=-1.5437941,
+)
+
+
+def patch_geocoder(
+    monkeypatch: pytest.MonkeyPatch, result: GeocodeResult | None, *, error: str | None = None
+) -> list[str]:
+    """Replace cli.geocode with a stub; returns the list of queries it received."""
+    calls: list[str] = []
+
+    def fake(query: str, fetch: object = None) -> GeocodeResult:
+        calls.append(query)
+        if error is not None:
+            raise ValueError(error)
+        assert result is not None
+        return result
+
+    monkeypatch.setattr("network_transfer.cli.geocode", fake)
+    return calls
+
+
+def test_add_city_then_use_it(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = patch_geocoder(monkeypatch, LEEDS)
+    cities_file = tmp_path / "cities.json"
+
+    code, out = run(capsys, "--cities-file", str(cities_file), "--add-city", "Leeds")
+    assert code == 0
+    assert "added 'Leeds' -> Leeds, West Yorkshire" in out
+    assert f"saved to {cities_file}" in out
+    assert calls == ["Leeds"]
+    assert "leeds" in json.loads(cities_file.read_text())
+
+    # The estimator run is offline: no further geocoder calls; the city resolves from file.
+    code, out = run(
+        capsys,
+        "--cities-file", str(cities_file),
+        "--size", "1T", "--from", "leeds", "--to", "eu-west-2", "--link", "1G",
+    )  # fmt: skip
+    assert code == 0
+    assert row(out, "Source", "Leeds")
+    assert row(out, "Destination", "London")
+    assert calls == ["Leeds"]
+    km = int(out.split("Approx. distance")[1].split("km")[0].strip().replace(",", ""))
+    assert 260 < km < 285  # Leeds-London
+
+    _, out = run(capsys, "--cities-file", str(cities_file), "--list-cities")
+    assert "leeds (added)" in out.splitlines()
+
+
+def test_add_city_override_is_flagged(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dorset = GeocodeResult("Portland", "Portland, Dorset, England", 50.55, -2.44)
+    patch_geocoder(monkeypatch, dorset)
+    _, out = run(
+        capsys, "--cities-file", str(tmp_path / "c.json"), "--add-city", "Portland, Dorset"
+    )
+    assert "added 'Portland' -> Portland, Dorset, England" in out
+    assert "[overrides built-in]" in out
+
+
+def test_add_city_failure_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_geocoder(monkeypatch, None, error="No match for 'Xyzzy'")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--cities-file", str(tmp_path / "c.json"), "--add-city", "Xyzzy"])
+    assert excinfo.value.code == 2
+    assert "No match for 'Xyzzy'" in capsys.readouterr().err
+
+
+def test_add_cities_helper_with_explicit_fetcher(tmp_path: Path) -> None:
+    raw = json.dumps(
+        [{"name": "Leeds", "display_name": "Leeds, UK", "lat": "53.8", "lon": "-1.5"}]
+    ).encode()
+    store = UserCities(tmp_path / "c.json")
+    lines = add_cities(["Leeds"], store, fetch=lambda _u: raw)
+    assert lines[0].startswith("added 'Leeds' -> Leeds, UK")
+    assert store.get("leeds") == City("Leeds", 53.8, -1.5)
+
+
+def test_unknown_city_error_mentions_add_city(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--size", "2T", "--link", "1G", "--from", "Xyzzyville", "--to", "dublin"])
+    assert "--add-city 'Xyzzyville'" in capsys.readouterr().err

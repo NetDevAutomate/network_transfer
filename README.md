@@ -51,9 +51,21 @@ nettransfer --size 50T --from manchester --to eu-west-1 --link 10G --path dx --p
 nettransfer --size 500G --distance 450km --link 500M --loss 0.5 --streams 1
 nettransfer --size 2T --from london --to sydney --link 1G --compare --verbose
 nettransfer --size 2T --from london --to dublin --link 1G --rtt 12 --loss 0.05 --json
+nettransfer --add-city "Leeds" --add-city "Portland, Dorset"   # fetch from OpenStreetMap, save
+nettransfer --size 1T --from leeds --to eu-west-2 --link 1G
 nettransfer --list-cities
 nettransfer --list-profiles
 ```
+
+### Cities not in the built-in list
+
+`--add-city NAME` looks the name up on [OpenStreetMap Nominatim](https://nominatim.org/),
+prints what it matched so you can see a wrong hit (Portland, Oregon vs Portland, Dorset),
+and saves it to `~/.config/nettransfer/cities.json` for every future run. Add a qualifier
+after a comma to disambiguate (`"Portland, Dorset"`); the saved key is the part before the
+comma, and a saved city overrides a built-in of the same name (flagged as
+`[overrides built-in]`). This is the **only** flag that touches the network — estimates
+themselves are fully offline. `--cities-file PATH` relocates the store.
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -61,6 +73,8 @@ nettransfer --list-profiles
 | `--link` | link size in bit/s: `100M`, `1G`, `10G` | required |
 | `--from` / `--to` | city names or AWS region codes (`eu-west-1`, `us-east-1`); fuzzy-matched | -- |
 | `--distance` | explicit great-circle distance instead of cities: `450km`, `280mi` | -- |
+| `--add-city` | geocode NAME online and save it for future runs (repeatable); exits | -- |
+| `--cities-file` | where added cities live | `~/.config/nettransfer/cities.json` |
 | `--path` | `internet` or `dx` (Direct Connect); sets loss and overhead defaults | `internet` |
 | `--profile` | `full` (1500 B), `jumbo` (9001 B, DX only), `imix` (shared/chatty link) | `full` |
 | `--loss` | packet loss in % (`0.1` = 0.1 %) | 0.1 % internet, 0.001 % dx |
@@ -157,12 +171,12 @@ because the fix is different in each case:
 
 ```sh
 uv sync
-uv run pytest                                   # 83 tests, coverage gate 90 %
+uv run pytest                                   # 106 tests, coverage gate 90 %
 uv run ruff check . && uv run ruff format --check .
 uv run pyright                                  # strict
 pre-commit run --hook-stage manual --all-files  # same gate the repo's hooks enforce
 ```
 
 Layout: `src/network_transfer/units.py` (parsing/formatting), `cities.py` (offline
-gazetteer + haversine), `model.py` (the physics and TCP model, every constant named),
+gazetteer + haversine + user store), `geocode.py` (Nominatim lookup for --add-city), `model.py` (the physics and TCP model, every constant named),
 `cli.py` (argparse, text/JSON rendering, advice).

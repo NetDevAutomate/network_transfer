@@ -8,8 +8,11 @@ model needs: a 10 km error on a 500 km path is a 0.1 ms error on the RTT.
 from __future__ import annotations
 
 import difflib
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
 
 EARTH_RADIUS_KM = 6371.0088
 
@@ -179,25 +182,96 @@ class UnknownCityError(ValueError):
         self.name = name
         self.suggestions = suggestions
         hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-        super().__init__(f"Unknown city {name!r}.{hint} Use --list-cities to see all.")
+        super().__init__(
+            f"Unknown city {name!r}.{hint} Use --list-cities to see all, or"
+            f" --add-city {name!r} to fetch it from OpenStreetMap."
+        )
 
 
-def lookup_city(name: str) -> City:
-    """Resolve a city name or alias (including AWS region codes) to a :class:`City`."""
+def default_store_path() -> Path:
+    """Where ``--add-city`` persists cities: ``~/.config/nettransfer/cities.json``."""
+    return Path.home() / ".config" / "nettransfer" / "cities.json"
+
+
+class UserCities:
+    """Cities the user added with ``--add-city``, kept in a small JSON file.
+
+    Entries take precedence over the built-in table so a deliberate override (your
+    "Portland" is the one in Dorset) sticks. The file is read lazily and only once.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path if path is not None else default_store_path()
+        self._entries: dict[str, dict[str, Any]] | None = None
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        if self._entries is None:
+            self._entries = {}
+            if self.path.exists():
+                try:
+                    data: object = json.loads(self.path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    msg = f"{self.path} is not valid JSON: {exc}"
+                    raise ValueError(msg) from exc
+                if isinstance(data, dict):
+                    items = cast("dict[object, object]", data).items()
+                    self._entries = {
+                        str(k): cast("dict[str, Any]", v) for k, v in items if isinstance(v, dict)
+                    }
+        return self._entries
+
+    def get(self, key: str) -> City | None:
+        """Return the stored city for a normalised key, or None."""
+        entry = self._load().get(key)
+        if entry is None:
+            return None
+        return City(name=str(entry["name"]), lat=float(entry["lat"]), lon=float(entry["lon"]))
+
+    def names(self) -> list[str]:
+        """Normalised keys of every stored city, sorted."""
+        return sorted(self._load())
+
+    def add(self, key: str, city: City, *, source: str) -> bool:
+        """Persist ``city`` under ``key``. Returns True if it replaced a built-in."""
+        entries = self._load()
+        entries[_normalise(key)] = {
+            "name": city.name,
+            "lat": city.lat,
+            "lon": city.lon,
+            "source": source,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return _normalise(key) in _CITIES
+
+
+def lookup_city(name: str, store: UserCities | None = None) -> City:
+    """Resolve a city name or alias (including AWS region codes) to a :class:`City`.
+
+    Order: user store (``--add-city``), then aliases, then the built-in table.
+    """
     key = _normalise(name)
+    if store is not None:
+        user_hit = store.get(key)
+        if user_hit is not None:
+            return user_hit
     # AWS region codes contain hyphens that _normalise turns into spaces; try both.
     raw_key = name.strip().lower()
     key = ALIASES.get(raw_key, ALIASES.get(key, key))
     coords = _CITIES.get(key)
     if coords is None:
-        suggestions = difflib.get_close_matches(key, list(_CITIES) + list(ALIASES), n=3)
+        candidates = list(_CITIES) + list(ALIASES) + (store.names() if store else [])
+        suggestions = difflib.get_close_matches(key, candidates, n=3)
         raise UnknownCityError(name, suggestions)
     return City(name=key.title(), lat=coords[0], lon=coords[1])
 
 
-def all_city_names() -> list[str]:
-    """Return every known city name, sorted."""
-    return sorted(_CITIES)
+def all_city_names(store: UserCities | None = None) -> list[str]:
+    """Return every known city name, sorted; user-added ones are suffixed ``(added)``."""
+    names = set(_CITIES)
+    if store is not None:
+        names |= {f"{n} (added)" for n in store.names()}
+    return sorted(names)
 
 
 def haversine_km(a: City, b: City) -> float:
