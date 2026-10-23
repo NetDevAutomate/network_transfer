@@ -1,0 +1,626 @@
+# repo_init copies this file into a new repo, or merges it into an existing config by hook
+# id. Hook ids come in two classes:
+# - managed: the secret scanners (detect-secrets*, known-secrets*, gitleaks*, titus*,
+#   trufflehog*).
+#   Re-running repo_init refreshes a same-id hook to this version, in place, wherever it
+#   sits. To keep a variant of your own, give it an id of its own.
+# - seeded: every other id. Added when a config lacks it, then never replaced or edited:
+#   a project's own variant (its args, files, stages) is the project's choice.
+# Stages:
+# - pre-commit: fast, file-scoped hygiene and lint, plus the secret scanners.
+# - pre-push: ONLY the secret scanners of the pushed commits: known-secrets, gitleaks,
+#   trufflehog, titus, and detect-secrets on a disposable copy of the pushed files.
+#   dirsync auto-commits with --no-verify, so the push host's pre-push is the one check on
+#   the way to GitHub. Only the scanners run there: a check that fails for lack of the
+#   project's environment invites `git push --no-verify`, which skips the scanners too.
+# - manual: the whole-project checks (type-check, tests + coverage). Run them with
+#   `pre-commit run --hook-stage manual --all-files` (append a hook id to run one).
+# default_stages runs hooks without `stages` (a merged config's own hooks too) at
+# pre-commit only: not at pre-push, and not at the manual stage either. It does not override
+# the stages a hook repo's manifest declares: pre-commit-hooks v6.0.0 puts
+# check-added-large-files, check-executables-have-shebangs,
+# check-shebang-scripts-are-executable, destroyed-symlinks, end-of-file-fixer and
+# trailing-whitespace at pre-push itself. So every hook below names its stages.
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  # File checks, fixers and linters: stages: [pre-commit] on each, never pre-push.
+  # detect-private-key and detect-aws-credentials are secret checks at pre-commit only. At
+  # pre-push, gitleaks covers private-key formats in the pushed commits. detect-aws-credentials
+  # looks for this host's own configured AWS secret values (env vars, AWS CLI credential
+  # files), not a format: at pre-push only known-secrets covers those, once they are in its
+  # store.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+        stages: [pre-commit]
+      - id: check-case-conflict
+        stages: [pre-commit]
+      - id: check-json
+        stages: [pre-commit]
+      - id: check-toml
+        stages: [pre-commit]
+      - id: check-yaml
+        args: [--unsafe]
+        stages: [pre-commit]
+      - id: end-of-file-fixer
+        stages: [pre-commit]
+      - id: debug-statements
+        stages: [pre-commit]
+      - id: detect-private-key
+        stages: [pre-commit]
+      - id: detect-aws-credentials
+        args: [--allow-missing-credentials]
+        stages: [pre-commit]
+      - id: trailing-whitespace
+        stages: [pre-commit]
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        stages: [pre-commit]
+      - id: check-merge-conflict
+        stages: [pre-commit]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: f368fb366ff7f2f808dd324b83a6d32267799e19  # frozen: v0.17.2
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+        stages: [pre-commit]
+      - id: ruff-format
+        stages: [pre-commit]
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: 68e8b45440415753fff70a312ece8da92ba85b4a  # frozen: v1.5.0
+    hooks:
+      # Pre-commit only. At pre-push this hook would read the work tree, and it rewrites
+      # .secrets.baseline and exits 3 whenever an audited line has moved, which dirsync's
+      # --no-verify commits make likely: the push would fail and leave a changed tracked
+      # file on the push host. detect-secrets-push (below) scans the pushed commits
+      # instead, on a disposable copy.
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: ".*\\.lock$"
+        stages: [pre-commit]
+
+  # Secret scanners of the commits (managed: repo_init adds and refreshes them by hook id).
+  # - Each scanner runs at pre-commit AND at pre-push (detect-secrets as the hook above at
+  #   pre-commit and as detect-secrets-push below at pre-push). dirsync auto-commits with
+  #   --no-verify, so the pre-push hooks on the push host are the check that cannot be
+  #   skipped on the way to GitHub.
+  # - language: system, so `pre-commit autoupdate` never moves them: the scanner is
+  #   whatever is on PATH. Each entry first checks a minimum version (the version these
+  #   flags were verified with) and fails closed, exit 1 plus a one-line install hint,
+  #   when the tool is missing or too old.
+  # - Pre-push hooks scan pre-commit's PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF, or the
+  #   whole ancestry of the pushed ref when the push includes a root commit. pre-commit
+  #   hands hooks only the FIRST ref of a multi-ref push; repo_secrets_guard's raw
+  #   pre-push hook scans every ref.
+  # - gitleaks and trufflehog only ever get commit SHAs: every ref (HEAD, the pushed ref)
+  #   is resolved with `git rev-parse` first, so their git never sees a name it could call
+  #   ambiguous ("warning: refname 'main' is ambiguous" when a tag and a branch share a name).
+  # - `pre-commit run --all-files` still scans only staged changes with these hooks. For
+  #   a whole-tree scan run `known-secrets scan-files .` or `gitleaks dir .`.
+  - repo: local
+    hooks:
+      # Keyed fingerprints of YOUR real values: hand-typed passwords have no format,
+      # so only known-secrets catches them. Tool missing: fails unless CI is set.
+      - id: known-secrets
+        name: known-secrets (staged)
+        entry: >-
+          bash -c 't=known-secrets f=0.2.0
+          h="uv tool install --python 3.12 --reinstall ~/code/personal/tools/known-secrets
+          (push hosts: known-secrets docs/push-host-setup.md)";
+          command -v $t >/dev/null 2>&1 || { if [ -n "${CI:-}" ]; then
+          echo "$t not installed: skipped because CI is set" >&2; exit 0; fi;
+          echo "$t missing: $h" >&2; exit 1; };
+          v=$($t --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h" >&2; exit 1; };
+          exec known-secrets check-staged'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: known-secrets-push
+        name: known-secrets (pushed commits)
+        entry: >-
+          bash -c 't=known-secrets f=0.2.0
+          h="uv tool install --python 3.12 --reinstall ~/code/personal/tools/known-secrets
+          (push hosts: known-secrets docs/push-host-setup.md)";
+          command -v $t >/dev/null 2>&1 || { if [ -n "${CI:-}" ]; then
+          echo "$t not installed: skipped because CI is set" >&2; exit 0; fi;
+          echo "$t missing: $h" >&2; exit 1; };
+          v=$($t --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h" >&2; exit 1; };
+          exec known-secrets check-push'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # Token formats: gitleaks' own `gitleaks-system` command, minus --verbose. --redact
+      # hides only the matched token, and --verbose prints ~20 characters either side of
+      # it, which can hold a value gitleaks cannot detect. So the JSON report goes to
+      # stdout, and `known-secrets gitleaks-report` (0.2.0+) parses it and prints only the
+      # rule, path and line (plus commit, at pre-push); in CI without known-secrets,
+      # python3 does. Each entry fails closed, and says why, when:
+      # - git cannot read the staged changes or resolve the pushed range;
+      # - the report does not parse as a list of findings; any finding blocks, whatever
+      #   gitleaks' exit code;
+      # - gitleaks' log has an ERR or FTL line. A gitleaks 8.30.1 limitation: it logs every
+      #   line its git command writes to stderr as "ERR [git] ...", a warning included,
+      #   then drops its findings and exits 0. Even a git warning means the scan did not
+      #   happen, so it blocks: fix what the [git] line reports, never use --no-verify.
+      - id: gitleaks-system
+        name: gitleaks (staged)
+        entry: >-
+          bash -c 't=gitleaks f=8.30.1 h="mise use -g gitleaks@8.30.1";
+          command -v $t >/dev/null 2>&1 || { echo "$t missing: $h" >&2; exit 1; };
+          v=$($t --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h" >&2; exit 1; };
+          git diff --cached --name-only >/dev/null 2>&1 || { echo "gitleaks: git cannot
+          read the staged changes, so nothing was scanned: blocked (fail closed)"; exit 1; };
+          e=$(mktemp "${TMPDIR:-/tmp}/gitleaks.XXXXXX") ||
+          { echo "gitleaks: no temp file: blocked (fail closed)"; exit 1; };
+          o=$(gitleaks git --pre-commit --redact --staged --report-format json
+          --report-path - 2>"$e"); x=$? b=0; cat "$e" >&2;
+          grep -Eq "ERR|FTL" "$e" && g=1 || g=0; rm -f "$e";
+          if command -v known-secrets >/dev/null 2>&1;
+          then printf "%s" "$o" | known-secrets gitleaks-report; p=$?;
+          elif [ -n "${CI:-}" ] && command -v python3 >/dev/null 2>&1;
+          then printf "%s" "$o" | python3 -c "import json,os,sys;
+          sys.excepthook=lambda *a: os._exit(2); d=json.load(sys.stdin);
+          assert type(d) == list and all(type(i) == dict for i in d);
+          [print(\"gitleaks: %s at %s:%s%s (value hidden)\" % (i.get(\"RuleID\"),
+          i.get(\"File\"), i.get(\"StartLine\"), i.get(\"Commit\") and \" in commit \"
+          + str(i.get(\"Commit\"))[:12] or \"\")) for i in d]; sys.exit(1 if d else 0)"; p=$?;
+          else echo "gitleaks: known-secrets reads its report and is missing: uv tool install
+          --python 3.12 --reinstall ~/code/personal/tools/known-secrets"; p=3; fi; o=;
+          [ $p = 1 ] && b=1;
+          [ $p -le 1 ] || { echo "gitleaks: its report could not be read (reader exit $p;
+          it needs known-secrets 0.2.0+), so the result is unknown: blocked (fail closed)";
+          b=1; };
+          [ $g = 0 ] || { echo "gitleaks: an ERR line in its log above: gitleaks drops its
+          findings when its git command prints anything, even a warning, so the scan cannot
+          be trusted: blocked (fail closed). Fix what the [git] line reports, never use
+          --no-verify"; b=1; };
+          [ $x = 0 ] || [ $p = 1 ] || { echo "gitleaks failed (exit $x): run it by hand to
+          see why"; b=1; }; exit $b'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: gitleaks-push
+        name: gitleaks (pushed commits)
+        entry: >-
+          bash -c 't=gitleaks f=8.30.1 h="mise use -g gitleaks@8.30.1";
+          command -v $t >/dev/null 2>&1 || { echo "$t missing: $h" >&2; exit 1; };
+          v=$($t --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h" >&2; exit 1; };
+          if [ -n "${PRE_COMMIT_FROM_REF:-}" ] && [ -n "${PRE_COMMIT_TO_REF:-}" ];
+          then n="$PRE_COMMIT_FROM_REF..$PRE_COMMIT_TO_REF";
+          a=$(git rev-parse -q --verify "$PRE_COMMIT_FROM_REF^{commit}" 2>/dev/null) &&
+          c=$(git rev-parse -q --verify "$PRE_COMMIT_TO_REF^{commit}" 2>/dev/null) &&
+          r="$a..$c" || r=; else n="${PRE_COMMIT_LOCAL_BRANCH:-HEAD}";
+          r=$(git rev-parse -q --verify "$n^{commit}" 2>/dev/null); fi;
+          [ -n "$r" ] && git rev-list --quiet "$r" -- >/dev/null 2>&1 || { echo "gitleaks: git
+          cannot resolve the pushed range $n, so nothing was scanned: blocked (fail closed)"; exit 1; };
+          e=$(mktemp "${TMPDIR:-/tmp}/gitleaks.XXXXXX") ||
+          { echo "gitleaks: no temp file: blocked (fail closed)"; exit 1; };
+          o=$(gitleaks git --redact --report-format json --report-path - --log-opts="$r"
+          2>"$e"); x=$? b=0; cat "$e" >&2;
+          grep -Eq "ERR|FTL" "$e" && g=1 || g=0; rm -f "$e";
+          if command -v known-secrets >/dev/null 2>&1;
+          then printf "%s" "$o" | known-secrets gitleaks-report; p=$?;
+          elif [ -n "${CI:-}" ] && command -v python3 >/dev/null 2>&1;
+          then printf "%s" "$o" | python3 -c "import json,os,sys;
+          sys.excepthook=lambda *a: os._exit(2); d=json.load(sys.stdin);
+          assert type(d) == list and all(type(i) == dict for i in d);
+          [print(\"gitleaks: %s at %s:%s%s (value hidden)\" % (i.get(\"RuleID\"),
+          i.get(\"File\"), i.get(\"StartLine\"), i.get(\"Commit\") and \" in commit \"
+          + str(i.get(\"Commit\"))[:12] or \"\")) for i in d]; sys.exit(1 if d else 0)"; p=$?;
+          else echo "gitleaks: known-secrets reads its report and is missing: uv tool install
+          --python 3.12 --reinstall ~/code/personal/tools/known-secrets"; p=3; fi; o=;
+          [ $p = 1 ] && b=1;
+          [ $p -le 1 ] || { echo "gitleaks: its report could not be read (reader exit $p;
+          it needs known-secrets 0.2.0+), so the result is unknown: blocked (fail closed)";
+          b=1; };
+          [ $g = 0 ] || { echo "gitleaks: an ERR line in its log above: gitleaks drops its
+          findings when its git command prints anything, even a warning, so the scan cannot
+          be trusted: blocked (fail closed). Fix what the [git] line reports, never use
+          --no-verify"; b=1; };
+          [ $x = 0 ] || [ $p = 1 ] || { echo "gitleaks failed (exit $x): run it by hand to
+          see why"; b=1; }; exit $b'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # Live credentials: blocks results that are verified, or unknown because
+      # verification failed. Fakes and revoked tokens verify as "unverified" and pass.
+      # At pre-commit, --since-commit and --branch both get HEAD's commit SHA: trufflehog
+      # scans the staged changes, and --branch keeps it from also scanning the commits
+      # since HEAD on every other local branch.
+      # At pre-push the scan is scoped to the pushed branch tip: --branch TO walks the
+      # pushed commits back to FROM, the commit the remote already has (commit messages
+      # included; merge resolutions, tag messages and other refs are not scanned).
+      # known-secrets-push is the scanner of the full pushed range.
+      # trufflehog switches to "pre-commit hook" mode (staged changes only, whatever the
+      # flags say) when PRE_COMMIT is set, so the push hook unsets it first.
+      # trufflehog has no --redact: results go through --json and only the detector,
+      # path and line are printed, so a live value never reaches a terminal or a log. A
+      # printed result blocks, whatever the exit code.
+      # trufflehog 3.97.6 exits 0 when its own git command fails, so each entry fails
+      # closed: git must first read the staged changes, or every object of the pushed
+      # commits (`rev-list --objects`, which also finds a missing blob), and an error line
+      # in trufflehog's log (kept, never printed) or an unexpected exit blocks. Such a block
+      # prints the command that shows the log, with the results sent to /dev/null. Its
+      # pre-commit mode cannot scan a repo's first commit (no HEAD to diff against: it logs
+      # an error and scans nothing), so that commit's staged files are copied out with
+      # `git checkout-index` and scanned with `trufflehog filesystem`. Temp files and that
+      # copy are removed on exit, interrupt included.
+      - id: trufflehog
+        name: trufflehog (staged)
+        entry: >-
+          bash -c 't=trufflehog f=3.97.6 h="mise use -g trufflehog@3.97.6";
+          command -v $t >/dev/null 2>&1 || { echo "$t missing: $h" >&2; exit 1; };
+          v=$($t --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h" >&2; exit 1; };
+          git diff --cached --name-only >/dev/null 2>&1 || { echo "trufflehog: git cannot
+          read the staged changes, so nothing was scanned: blocked (fail closed)"; exit 1; };
+          e=$(mktemp "${TMPDIR:-/tmp}/trufflehog.XXXXXX") ||
+          { echo "trufflehog: no temp file: blocked (fail closed)"; exit 1; }; d= u=;
+          trap "rm -rf -- \"\$e\" \${d:+\"\$d\"}" EXIT; trap "exit 130" INT; trap "exit 143" TERM;
+          if c=$(git rev-parse -q --verify "HEAD^{commit}" 2>/dev/null);
+          then set -- git file://. --since-commit "$c" --branch "$c" --trust-local-git-config;
+          w="TRUFFLEHOG_PRE_COMMIT=1 trufflehog $*";
+          else d=$(mktemp -d "${TMPDIR:-/tmp}/trufflehog.XXXXXX") &&
+          git checkout-index -a --prefix="$d/" || { echo "trufflehog: git cannot copy out the
+          staged files of the first commit, so nothing was scanned: blocked (fail closed)";
+          exit 1; }; set -- filesystem .;
+          w="git checkout-index -a --prefix=DIR/ && cd DIR && trufflehog filesystem ."; fi;
+          o=$(cd "${d:-.}" && trufflehog "$@" --results=verified,unknown --fail --no-update
+          --json 2>"$e"); r=$?;
+          grep -q "\"level\":\"error\"" "$e" && g=1 || g=0; rm -rf -- "$e" ${d:+"$d"};
+          k=$(printf "%s\n" "$o" | grep -c "\"DetectorName\"");
+          printf "%s\n" "$o" | while IFS= read -r l; do case $l in *\"DetectorName\"*)
+          y=${l#*\"DetectorName\":\"}; p=${l#*\"file\":\"}; n=${l#*\"line\":};
+          echo "trufflehog: ${y%%\"*} credential at ${p%%\"*}:${n%%[!0-9]*} (value hidden)";;
+          esac; done; o=;
+          case $r in 0) ;; 183) echo "trufflehog: rotate the credential(s) above, then remove them";;
+          *) echo "trufflehog failed (exit $r), so the result is unknown: blocked (fail closed)";
+          u=1;; esac; [ $g = 0 ] || { echo "trufflehog: an error in its log (it exits 0 on its
+          own git failures), so the result is unknown: blocked (fail closed)"; [ $r = 0 ] && r=1;
+          u=1; }; [ "$k" = 0 ] || [ $r != 0 ] || { echo "trufflehog: it printed a result above
+          but exited 0: blocked (fail closed)"; r=1; };
+          [ -z "$u" ] || echo "trufflehog: to see why, run (the log only: results, which can
+          hold the value, go to /dev/null): $w --results=verified,unknown --no-update --json
+          >/dev/null; then fix what it reports. Never use --no-verify"; exit $r'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: trufflehog-push
+        name: trufflehog (pushed commits)
+        entry: >-
+          bash -c 't=trufflehog f=3.97.6 h="mise use -g trufflehog@3.97.6";
+          command -v $t >/dev/null 2>&1 || { echo "$t missing: $h" >&2; exit 1; };
+          v=$($t --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h" >&2; exit 1; };
+          q=; if [ -n "${PRE_COMMIT_FROM_REF:-}" ] && [ -n "${PRE_COMMIT_TO_REF:-}" ];
+          then n="$PRE_COMMIT_FROM_REF..$PRE_COMMIT_TO_REF";
+          a=$(git rev-parse -q --verify "$PRE_COMMIT_FROM_REF^{commit}" 2>/dev/null) &&
+          c=$(git rev-parse -q --verify "$PRE_COMMIT_TO_REF^{commit}" 2>/dev/null) &&
+          q="$a..$c" && set -- --since-commit "$a" --branch "$c";
+          else n="${PRE_COMMIT_LOCAL_BRANCH:-HEAD}";
+          c=$(git rev-parse -q --verify "$n^{commit}" 2>/dev/null) && q=$c && set -- --branch "$c"; fi;
+          [ -n "$q" ] && git rev-list --quiet --objects "$q" -- >/dev/null 2>&1 || { echo
+          "trufflehog: git cannot read the pushed commits $n (an unknown revision or a missing
+          object), so they were not scanned: blocked (fail closed)"; exit 1; };
+          unset PRE_COMMIT TRUFFLEHOG_PRE_COMMIT;
+          e=$(mktemp "${TMPDIR:-/tmp}/trufflehog.XXXXXX") ||
+          { echo "trufflehog: no temp file: blocked (fail closed)"; exit 1; }; u=;
+          trap "rm -f -- \"\$e\"" EXIT; trap "exit 130" INT; trap "exit 143" TERM;
+          w="trufflehog git file://. $* --trust-local-git-config";
+          o=$(trufflehog git file://. "$@" --results=verified,unknown --fail --no-update
+          --trust-local-git-config --json 2>"$e"); r=$?;
+          grep -q "\"level\":\"error\"" "$e" && g=1 || g=0; rm -f -- "$e";
+          k=$(printf "%s\n" "$o" | grep -c "\"DetectorName\"");
+          printf "%s\n" "$o" | while IFS= read -r l; do case $l in *\"DetectorName\"*)
+          y=${l#*\"DetectorName\":\"}; p=${l#*\"file\":\"}; n=${l#*\"line\":};
+          echo "trufflehog: ${y%%\"*} credential at ${p%%\"*}:${n%%[!0-9]*} (value hidden)";;
+          esac; done; o=;
+          case $r in 0) ;; 183) echo "trufflehog: rotate the credential(s) above, then remove them";;
+          *) echo "trufflehog failed (exit $r), so the result is unknown: blocked (fail closed)";
+          u=1;; esac; [ $g = 0 ] || { echo "trufflehog: an error in its log (it exits 0 on its
+          own git failures), so the result is unknown: blocked (fail closed)"; [ $r = 0 ] && r=1;
+          u=1; }; [ "$k" = 0 ] || [ $r != 0 ] || { echo "trufflehog: it printed a result above
+          but exited 0: blocked (fail closed)"; r=1; };
+          [ -z "$u" ] || echo "trufflehog: to see why, run (the log only: results, which can
+          hold the value, go to /dev/null): $w --results=verified,unknown --no-update --json
+          >/dev/null; then fix what it reports. Never use --no-verify"; exit $r'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # titus: the default ruleset over every blob the commit or push adds. Each hook runs
+      # `known-secrets titus-args`, which copies each unique blob out of git (never the work
+      # tree) to t/<blob id>/f[.<kind>] inside a mktemp dir and prints the titus flags, then
+      # `titus scan` on that copy, then `known-secrets titus-report`, which maps each result
+      # back to every repo path and commit holding the blob and prints rule, path and line
+      # only (value hidden).
+      # - Never `titus scan --git`: it walks every ref, the work tree and .git, and has no
+      #   range option. titus gets commit SHAs only, through the copy, never a ref name.
+      # - SARIF is the one titus format that names the scanned file (the copy) per result.
+      # - --ignore=/dev/null: titus' built-in ignore list silently drops lock files and
+      #   *.min.js; titus-args already chose exactly what to scan.
+      # - Archives are extracted by the kind their bytes (or, without magic, their name)
+      #   show; extraction limits are titus' defaults, passed explicitly.
+      # - titus's validation, dynamic-scoring and automatic accessibility options are never
+      #   used, because they contact the network; accessibility is always private.
+      # - Fail closed: a finding, a titus exit other than 0, an error or warning line in
+      #   titus' log (it exits 0 when it cannot read a file), a reader or helper error, a
+      #   missing tool, or titus older than 1.2.11 or known-secrets older than 0.3.0 blocks.
+      # - The datastore (--output=titus.ds) and every scratch file live in the mktemp dir,
+      #   removed on exit, interrupt included; nothing is written to the work tree or .git.
+      #   The report, which holds the value, is deleted as soon as it is read.
+      # - Allowlist: only an audited .secrets.baseline hash line at the repo root
+      #   (np.generic.1 on `"hashed_secret": "<40 hex>"`) is dropped, by titus-report.
+      # CI: install titus and known-secrets 0.3.0+, or set SKIP=titus,titus-push; these hooks never skip themselves.
+      - id: titus
+        name: titus (staged)
+        entry: >-
+          bash -c 't=titus f=1.2.11 h="mise use -g github:praetorian-inc/titus@1.2.11"
+          k="uv tool install --python 3.12 --reinstall ~/code/personal/tools/known-secrets
+          (push hosts: known-secrets docs/push-host-setup.md)" m=staged r=;
+          command -v $t >/dev/null 2>&1 || { echo "$t missing: $h: blocked (fail closed)" >&2; exit 1; };
+          v=$($t version 2>&1 | grep -Eo "^Titus v?[0-9]+[.][0-9]+[.][0-9]+" | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h: blocked (fail closed)" >&2; exit 1; };
+          command -v known-secrets >/dev/null 2>&1 || { echo "titus: known-secrets 0.3.0+ prepares
+          and reads its scan and is missing: $k: blocked (fail closed)" >&2; exit 1; };
+          v=$(known-secrets --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" 0.3.0 "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = 0.3.0 ] ||
+          { echo "titus: known-secrets ${v:-unknown} is older than 0.3.0: $k: blocked (fail closed)" >&2; exit 1; };
+          d=$(mktemp -d "${TMPDIR:-/tmp}/titus.XXXXXX") ||
+          { echo "titus: no temp dir: blocked (fail closed)" >&2; exit 1; };
+          w=; trap "rm -rf -- \"\$d\"" EXIT;
+          trap "[ -n \"\$w\" ] && kill \$w 2>/dev/null; exit 130" INT;
+          trap "[ -n \"\$w\" ] && kill \$w 2>/dev/null; exit 143" TERM;
+          known-secrets titus-args $m --workdir "$d/w" >"$d/args" || { a=$?; echo "titus: known-secrets
+          titus-args failed (exit $a; reason above), so nothing was scanned: blocked (fail closed)" >&2;
+          r=1; };
+          x=0 g=0 p=0 b=0 u=;
+          if [ -z "$r" ]; then
+          set -f; set -- $(tr "\0" " " <"$d/args"); set +f;
+          (cd "$d/w" && exec titus scan "$@") >"$d/report" 2>"$d/log" & w=$!; wait $w; x=$?; w=;
+          grep -Eq "^(Error|error|warning|panic|fatal)[: ]|^\[warn\]" "$d/log" && g=1;
+          known-secrets titus-report --workdir "$d/w" <"$d/report" >&2; p=$?; rm -f -- "$d/report";
+          [ $p = 1 ] && b=1;
+          [ $p -le 1 ] || { echo "titus: its report could not be read (reader exit $p), so the
+          result is unknown: blocked (fail closed)" >&2; b=1 u=1; };
+          [ $g = 0 ] || { echo "titus: an error or warning in its log (it exits 0 when it cannot
+          read a file), so the result is unknown: blocked (fail closed)" >&2; b=1 u=1; };
+          [ $x = 0 ] || { echo "titus failed (exit $x), so the result is unknown: blocked (fail closed)" >&2; b=1 u=1; };
+          else b=1 u=1; fi;
+          [ $b = 0 ] || [ -n "$u" ] || echo "titus: remove each value above from the commit
+          (rotate it if it is real), then try again" >&2;
+          [ -z "$u" ] || echo "titus: to see why, run (titus log only; its report, which holds
+          the value, goes to /dev/null): d=\$(mktemp -d) && known-secrets titus-args staged
+          --workdir \"\$d/w\" >\"\$d/args\" && (cd \"\$d/w\" && xargs -0 titus scan <\"\$d/args\"
+          >/dev/null); rm -rf \"\$d\". Never use --no-verify" >&2;
+          exit $b'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: titus-push
+        name: titus (pushed commits)
+        entry: >-
+          bash -c 't=titus f=1.2.11 h="mise use -g github:praetorian-inc/titus@1.2.11"
+          k="uv tool install --python 3.12 --reinstall ~/code/personal/tools/known-secrets
+          (push hosts: known-secrets docs/push-host-setup.md)" m=push r=;
+          command -v $t >/dev/null 2>&1 || { echo "$t missing: $h: blocked (fail closed)" >&2; exit 1; };
+          v=$($t version 2>&1 | grep -Eo "^Titus v?[0-9]+[.][0-9]+[.][0-9]+" | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h: blocked (fail closed)" >&2; exit 1; };
+          command -v known-secrets >/dev/null 2>&1 || { echo "titus: known-secrets 0.3.0+ prepares
+          and reads its scan and is missing: $k: blocked (fail closed)" >&2; exit 1; };
+          v=$(known-secrets --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" 0.3.0 "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = 0.3.0 ] ||
+          { echo "titus: known-secrets ${v:-unknown} is older than 0.3.0: $k: blocked (fail closed)" >&2; exit 1; };
+          d=$(mktemp -d "${TMPDIR:-/tmp}/titus.XXXXXX") ||
+          { echo "titus: no temp dir: blocked (fail closed)" >&2; exit 1; };
+          w=; trap "rm -rf -- \"\$d\"" EXIT;
+          trap "[ -n \"\$w\" ] && kill \$w 2>/dev/null; exit 130" INT;
+          trap "[ -n \"\$w\" ] && kill \$w 2>/dev/null; exit 143" TERM;
+          known-secrets titus-args $m --workdir "$d/w" >"$d/args" || { a=$?; echo "titus: known-secrets
+          titus-args failed (exit $a; reason above), so nothing was scanned: blocked (fail closed)" >&2;
+          r=1; };
+          x=0 g=0 p=0 b=0 u=;
+          if [ -z "$r" ]; then
+          set -f; set -- $(tr "\0" " " <"$d/args"); set +f;
+          (cd "$d/w" && exec titus scan "$@") >"$d/report" 2>"$d/log" & w=$!; wait $w; x=$?; w=;
+          grep -Eq "^(Error|error|warning|panic|fatal)[: ]|^\[warn\]" "$d/log" && g=1;
+          known-secrets titus-report --workdir "$d/w" <"$d/report" >&2; p=$?; rm -f -- "$d/report";
+          [ $p = 1 ] && b=1;
+          [ $p -le 1 ] || { echo "titus: its report could not be read (reader exit $p), so the
+          result is unknown: blocked (fail closed)" >&2; b=1 u=1; };
+          [ $g = 0 ] || { echo "titus: an error or warning in its log (it exits 0 when it cannot
+          read a file), so the result is unknown: blocked (fail closed)" >&2; b=1 u=1; };
+          [ $x = 0 ] || { echo "titus failed (exit $x), so the result is unknown: blocked (fail closed)" >&2; b=1 u=1; };
+          else b=1 u=1; fi;
+          [ $b = 0 ] || [ -n "$u" ] || echo "titus: remove each value above from the commit
+          (rotate it if it is real), then try again" >&2;
+          if [ -n "$u" ]; then
+          if [ -f "$d/w/commits" ]; then
+          if c=$(mktemp "${TMPDIR:-/tmp}/titus-commits.XXXXXX") && cp -- "$d/w/commits" "$c"; then
+          echo "titus: to see why, run (titus log only; its report, which holds the value, goes to
+          /dev/null; $c holds commit SHAs only, never a value, and is the only file left behind):
+          d=\$(mktemp -d) && known-secrets titus-args commits --workdir \"\$d/w\" <\"$c\"
+          >\"\$d/args\" && (cd \"\$d/w\" && xargs -0 titus scan <\"\$d/args\" >/dev/null);
+          rm -rf \"\$d\"; rm -f \"$c\". Never use --no-verify" >&2;
+          else rm -f -- "$c" 2>/dev/null;
+          echo "titus: the pushed commit list could not be saved for a re-run by hand, so to see
+          why, re-run the push. Never use --no-verify" >&2; fi;
+          else
+          echo "titus: no commit list was written (the push itself could not be read; reason
+          above), so there is nothing to re-run by hand: fix that, then re-run the push. Never use
+          --no-verify" >&2; fi; fi;
+          exit $b'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # detect-secrets on the pushed commits, in a disposable copy. dirsync's --no-verify
+      # commits skip the detect-secrets hook above, and its keyword and entropy plugins are
+      # the one check at pre-push for a new password that is neither in known-secrets' store
+      # nor in a token format.
+      # - Range: as in gitleaks-push (SHAs only). A push that includes the root commit takes
+      #   the tip's whole tree.
+      # - Copy: the tip's version of each file added, modified or changed in type in the
+      #   range (git diff --no-renames --diff-filter=AMT: a renamed file counts as added, a
+      #   symlink replaced by a file as a type change; *.lock excluded as in the hook above;
+      #   submodules skipped), plus the tip's .secrets.baseline, goes into a mktemp dir that
+      #   is removed on exit, interrupt included. The work tree and the tracked baseline are
+      #   never touched. Two pushed paths whose names differ only in case or Unicode form
+      #   are one name on a default macOS volume, so the copy would hold only one of them:
+      #   such a clash blocks.
+      # - Scan: detect-secrets-hook runs `git diff` and exits 1 when the baseline looks
+      #   unstaged, so the copy is a throwaway repo with everything staged, and the hook's
+      #   own GIT_* variables (GIT_DIR, GIT_INDEX_FILE, ...) are cleared for it.
+      # - Result: exit 1 with a finding blocks and prints its type and path:line only. Exit
+      #   3 alone (the pushed baseline is out of date: line numbers moved, an entry went, or
+      #   its format is older; refreshed in the copy only) passes with a note; verbose: true
+      #   shows it. Any other exit fails closed and says how to reproduce it in a scratch
+      #   clone; a missing or old tool fails closed with the uv install hint.
+      # It reads the tip's content only: a password added and removed again inside the
+      # pushed range is left to gitleaks and known-secrets.
+      - id: detect-secrets-push
+        name: detect-secrets (pushed commits)
+        entry: >-
+          bash -c 't=detect-secrets-hook f=1.5.0 h="uv tool install detect-secrets==1.5.0";
+          command -v $t >/dev/null 2>&1 || { echo "$t missing: $h" >&2; exit 1; };
+          v=$($t --version 2>&1 | grep -Eo "[0-9]+[.][0-9]+[.][0-9]+" | head -n1);
+          [ "$(printf "%s\n" $f "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = $f ] ||
+          { echo "$t ${v:-unknown} is older than $f: $h" >&2; exit 1; };
+          if [ -n "${PRE_COMMIT_FROM_REF:-}" ] && [ -n "${PRE_COMMIT_TO_REF:-}" ];
+          then n="$PRE_COMMIT_FROM_REF..$PRE_COMMIT_TO_REF";
+          a=$(git rev-parse -q --verify "$PRE_COMMIT_FROM_REF^{commit}" 2>/dev/null) &&
+          c=$(git rev-parse -q --verify "$PRE_COMMIT_TO_REF^{commit}" 2>/dev/null) || c=;
+          else n="${PRE_COMMIT_LOCAL_BRANCH:-HEAD}"; a=$(git hash-object -t tree /dev/null) &&
+          c=$(git rev-parse -q --verify "$n^{commit}" 2>/dev/null) || c=; fi;
+          [ -n "$c" ] || { echo "detect-secrets-push: git cannot resolve the pushed range $n,
+          so nothing was scanned: blocked (fail closed)"; exit 1; };
+          d=$(mktemp -d "${TMPDIR:-/tmp}/detect-secrets.XXXXXX") ||
+          { echo "detect-secrets-push: no temp dir: blocked (fail closed)"; exit 1; };
+          trap "rm -rf -- \"\$d\"" EXIT; trap "exit 130" INT; trap "exit 143" TERM;
+          git diff --no-renames -z --raw --no-abbrev --diff-filter=AMT "$a" "$c" >"$d/raw" &&
+          mkdir "$d/t" && : >"$d/list" || { echo "detect-secrets-push: git cannot list the
+          files pushed in $n, so nothing was scanned: blocked (fail closed)"; exit 1; }; q=;
+          while IFS= read -r -d "" m && IFS= read -r -d "" p; do
+          case $m in *" 160000 "*) continue;; esac; case $p in *.lock) continue;; esac;
+          case /$p/ in */../*|*/./*|*/[.][gG][iI][tT]/*) echo "detect-secrets-push: a path
+          git never writes ($p) in $n: blocked (fail closed)"; exit 1;; esac;
+          s=${m#:* * * }; s=${s%% *}; [ "$p" != .secrets.baseline ] || q=1;
+          { [ ! -e "$d/t/$p" ] && case $p in */*) mkdir -p "$d/t/${p%/*}";; esac; } || {
+          echo "detect-secrets-push: $p clashes with another pushed path in the copy (on this
+          disk, names that differ only in case or Unicode form are one name), so one of them
+          would go unscanned: blocked (fail closed)"; exit 1; };
+          git cat-file blob "$s" >"$d/t/$p" || { echo "detect-secrets-push: git cannot read $p
+          in $n, so it was not scanned: blocked (fail closed)"; exit 1; };
+          printf "%s\0" "$p" >>"$d/list"; done <"$d/raw";
+          [ -s "$d/list" ] || exit 0; b=;
+          if git cat-file -e "$c:.secrets.baseline" 2>/dev/null; then b=.secrets.baseline;
+          [ -n "$q" ] || [ ! -e "$d/t/$b" ] || { echo "detect-secrets-push: $b clashes with
+          another pushed path in the copy (on this disk, names that differ only in case or
+          Unicode form are one name), so one of them would go unscanned: blocked (fail closed)";
+          exit 1; }; git cat-file blob "$c:$b" >"$d/t/$b" || { echo "detect-secrets-push: git
+          cannot read the pushed .secrets.baseline: blocked (fail closed)"; exit 1; }; fi;
+          ( unset $(git rev-parse --local-env-vars); export GIT_CONFIG_NOSYSTEM=1
+          GIT_CONFIG_GLOBAL=/dev/null CLICOLOR=0 CLICOLOR_FORCE=0; cd "$d/t" &&
+          git -c init.defaultBranch=main init -q && git add -A || exit 90;
+          ds() { $t ${b:+--baseline "$b"} -- "$@" >>"$d/out" 2>&1; echo $? >>"$d/rc";
+          [ -z "$b" ] || git add -- "$b"; }; set --;
+          while IFS= read -r -d "" p; do set -- "$@" "$p"; [ $# -lt 200 ] || { ds "$@";
+          set --; }; done <"$d/list"; [ $# = 0 ] || ds "$@"; exit 0 ) >/dev/null 2>&1 ||
+          { echo "detect-secrets-push: no throwaway repo for the copy, so nothing was
+          scanned: blocked (fail closed)"; exit 1; };
+          [ -s "$d/rc" ] || { echo "detect-secrets-push: no result was recorded, so the result
+          is unknown: blocked (fail closed)"; exit 1; }; k=0 y=;
+          while IFS= read -r l; do case $l in "Secret Type: "*) y=${l#Secret Type: };;
+          "Location: "*) w=${l#Location:}; w=${w#"${w%%[! ]*}"}; k=$((k+1));
+          echo "detect-secrets-push: ${y:-?} at $w (value hidden)";; esac; done <"$d/out";
+          e=0 s=0; while IFS= read -r x; do case $x in 0) ;; 3) s=1;; 1) [ $k -gt 0 ] || e=1;;
+          *) e=1;; esac; done <"$d/rc";
+          [ $k = 0 ] || { echo "detect-secrets-push: remove each value above from the pushed
+          commits (rotate it if it is real; mark a false positive with an inline allowlist
+          pragma), then push again"; exit 1; };
+          [ $e = 0 ] || { z=$(tr "\n" " " <"$d/rc"); echo "detect-secrets-push:
+          detect-secrets-hook failed without naming a finding (exit ${z% }), so the result
+          is unknown: blocked (fail closed). To see why, check out the pushed commit in a
+          scratch clone and run detect-secrets-hook --baseline .secrets.baseline there, on the
+          files this push adds or changes (run in your own work tree, it can rewrite the
+          tracked .secrets.baseline)"; exit 1; };
+          [ $s = 0 ] || echo "detect-secrets-push: the pushed .secrets.baseline is out of date:
+          refreshed in a temporary copy only (to update the tracked file, run pre-commit run
+          detect-secrets --all-files where you commit, then commit it)";
+          exit 0'
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true
+        stages: [pre-push]
+
+  - repo: local
+    hooks:
+      # Whole-project checks: manual stage, never pre-push. A push host has neither the
+      # project's env nor pytest-cov, and a gate that fails there for that reason invites
+      # --no-verify, which skips the secret scanners too. Run them before you push (the
+      # comment on each `stages` line); without --all-files pre-commit only considers
+      # staged files. types: [python] keeps them inert in non-Python repos.
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [manual]  # pre-commit run --hook-stage manual --all-files pyright
+
+      - id: pytest
+        name: pytest
+        entry: uv run pytest --cov-fail-under=90
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [manual]  # pre-commit run --hook-stage manual --all-files pytest
+
+      - id: check-commit-author
+        name: Check commit author is Andy Taylor
+        entry: >-
+          bash -c 'author=$(git config user.name);
+          email=$(git config user.email);
+          if [ "$author" != "Andy Taylor" ] ||
+          [ "$email" != "andy.taylor@mail.com" ]; then
+          echo "ERROR: Commit author must be Andy Taylor <andy.taylor@mail.com>";
+          echo "Current: $author <$email>";
+          echo "Fix: git config user.name \"Andy Taylor\" && git config user.email andy.taylor@mail.com";
+          exit 1; fi'
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]

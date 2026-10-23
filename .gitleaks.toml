@@ -1,0 +1,18 @@
+# gitleaks configuration: gitleaks' default rules plus one narrow allowlist.
+# repo_init creates this file when a repo has none and never overwrites an existing one.
+# repo_secrets_guard keeps the same rules in .git/hooks, for repos that have none.
+[extend]
+useDefault = true
+
+# Why: detect-secrets stores each audited finding in .secrets.baseline as a SHA-1 of the
+# value (a "hashed_secret" line), never the value itself. gitleaks' generic-api-key rule
+# matches those lines, so every audited baseline entry would block commits and pushes.
+# This exempts only that rule, only in the repo-root .secrets.baseline, and only on a line
+# that holds nothing but a hashed_secret entry. Anything else, there or elsewhere, blocks.
+[[allowlists]]
+description = "detect-secrets baseline: SHA-1 hashes of audited values, never the values"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^\.secrets\.baseline$''']
+regexTarget = "line"
+regexes = ['''^\s*"hashed_secret": "[0-9a-f]{40}",?$''']

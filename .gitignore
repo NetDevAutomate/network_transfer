@@ -1,0 +1,42 @@
+# Agentic Agent Files
+.claude/
+CLAUDE.md
+.kiro/
+.crush/
+.opencode/
+.cursor/
+.windsurf/
+.continue/
+.aider/
+.copilot/
+.speckit/
+.openspec/
+
+# IDE Files
+.vscode/
+.idea/
+*.code-workspace
+.zed/
+
+# Secrets: never commit these (repo_init)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Project
+.coverage
+.coverage.*
+htmlcov/
+dist/

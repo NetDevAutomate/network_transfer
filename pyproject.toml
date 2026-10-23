@@ -1,0 +1,53 @@
+[project]
+name = "network-transfer"
+version = "0.1.0"
+description = "Estimate WAN transfer time for bulk data moves (e.g. AWS DMS) from distance, link size, packet profile and loss."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Andy Taylor" }]
+dependencies = []
+
+[project.scripts]
+nettransfer = "network_transfer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/network_transfer"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pyright>=1.1.390",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=network_transfer --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["src/network_transfer"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "RUF", "N", "D"]
+ignore = ["D203", "D213", "D105", "D107"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "ANN"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
